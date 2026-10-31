@@ -18,6 +18,7 @@ import sys
 import json
 import math
 import time
+import fcntl
 import socket
 import ctypes
 import hashlib
@@ -46,6 +47,38 @@ if not (_RUNTIME_DIR and os.path.isdir(_RUNTIME_DIR)
         and os.access(_RUNTIME_DIR, os.W_OK)):
     _RUNTIME_DIR = os.path.join(HOME, '.cache')
 SOCK_FILE = os.path.join(_RUNTIME_DIR, 'clip-hist.sock')
+LOCK_FILE = os.path.join(_RUNTIME_DIR, 'clip-hist.lock')
+
+
+def _try_lock():
+    """拿单实例锁。成功返回文件对象（调用方需一直持有到进程退出），失败返回 None。"""
+    f = None
+    try:
+        f = open(LOCK_FILE, 'w')
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.write(str(os.getpid()))
+        f.flush()
+        return f
+    except Exception:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+        return None
+
+
+def _socket_alive():
+    """socket 是否真的能连上（存在文件不等于服务在跑）。"""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.connect(SOCK_FILE)
+        s.sendall(b'ping')
+        s.close()
+        return True
+    except Exception:
+        return False
 
 MAX_ITEMS = 500          # 默认条目上限（可在设置面板里改）
 MAX_CHARS = 200000       # 单条最大字符数，超出不记录
@@ -182,21 +215,45 @@ class Store(object):
         try:
             with open(self.path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if isinstance(data, list):
-                self.items = [x for x in data
-                              if isinstance(x, dict) and ('v' in x or 'h' in x)]
-        except Exception:
+            if not isinstance(data, list):
+                raise ValueError('root is not a list')
+            self.items = [x for x in data
+                          if isinstance(x, dict) and ('v' in x or 'h' in x)]
+        except FileNotFoundError:
+            self.items = []          # 首次运行，正常情况
+        except Exception as e:
+            # 文件存在但解析失败：绝不能把内存置空后照常 save，
+            # 否则下次 push 会把损坏内容和旧历史一起覆盖掉。
+            # 先改名留档，再从空列表开始。
             self.items = []
+            self._quarantine(e)
 
-    def save(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + '.tmp'
+    def _quarantine(self, err):
         try:
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(self.items, f, ensure_ascii=False)
-            os.replace(tmp, self.path)
+            bak = '%s.corrupt-%d' % (self.path, int(time.time()))
+            os.replace(self.path, bak)
+            sys.stderr.write('[cliphist] 历史文件无法解析（%s），已另存为 %s\n'
+                             % (err, bak))
+            sys.stderr.flush()
         except Exception:
             pass
+
+    def save(self):
+        d = os.path.dirname(self.path)
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        except Exception:
+            pass
+        tmp = self.path + '.tmp'
+        try:
+            # 用 0600 打开：历史里有你复制过的所有内容，不该让同机其他用户读到
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self.items, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            sys.stderr.write('[cliphist] 历史保存失败：%s\n' % e)
+            sys.stderr.flush()
 
     @staticmethod
     def _key(it):
@@ -278,6 +335,20 @@ class Store(object):
         self.save()
 
 
+def _fix_perms():
+    """把数据目录与历史文件的权限收紧到仅本人可访问（兼容已存在的旧文件）。"""
+    for d in (DATA_DIR, IMG_DIR):
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)
+        except Exception:
+            pass
+    try:
+        os.chmod(HISTORY_FILE, 0o600)
+    except Exception:
+        pass
+
+
 def human_time(ts):
     d = max(0, time.time() - ts)
     if d < 60:
@@ -344,7 +415,7 @@ def load_config(force=False):
 def save_config(c):
     global _CONFIG_CACHE
     _CONFIG_CACHE = dict(c)
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(CONFIG_FILE), mode=0o700, exist_ok=True)
     tmp = CONFIG_FILE + '.tmp'
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -554,6 +625,7 @@ class ClipPanel(object):
         self.prev_window = None
         self.win = None
         self._pos_timer = None
+        self._search_timer = None
         self._build()
 
     # ---------------- 构建 ----------------
@@ -728,8 +800,12 @@ class ClipPanel(object):
             self.show()
 
     def show(self):
-        self.store.load()
+        # 不再每次打开都 store.load()：内存里的 items 就是最新状态，
+        # 而外部改历史现在都走 IPC。这里重读等于每次唤出都读一遍整份历史。
         self.prev_window = self._active_window()
+        if self._search_timer:
+            GLib.source_remove(self._search_timer)
+            self._search_timer = None
         self.entry.set_text('')
         self._rebuild()
         self.win.show_all()
@@ -967,10 +1043,18 @@ class ClipPanel(object):
         return da
 
     def _on_search(self, entry):
+        # 每敲一个字符就重建 80 行代价太大，这里合并成 120ms 一次
+        if self._search_timer:
+            GLib.source_remove(self._search_timer)
+        self._search_timer = GLib.timeout_add(120, self._do_search)
+
+    def _do_search(self):
+        self._search_timer = None
         self._rebuild()
         rows = self.listbox.get_children()
         if rows and rows[0].get_selectable():
             self.listbox.select_row(rows[0])
+        return False
 
     # ---------------- 键盘 ----------------
 
@@ -1071,13 +1155,21 @@ class ClipPanel(object):
         GLib.timeout_add(180, self._send_keys, prev)
 
     def _send_keys(self, prev):
-        # 直接 exec xdotool，不再套一层 /bin/sh -c
-        cmd = ['xdotool']
+        # 先激活原窗口并确认成功，失败就不发 Ctrl+V ——
+        # 否则目标窗口已经关了，内容会粘到当前焦点的随便哪个窗口上。
         if prev:
-            cmd += ['windowactivate', '--sync', str(prev)]
-        cmd += ['key', '--clearmodifiers', 'ctrl+v']
+            try:
+                r = subprocess.run(
+                    ['xdotool', 'windowactivate', '--sync', str(prev)],
+                    timeout=1.5, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                if r.returncode != 0:
+                    return False
+            except Exception:
+                return False        # 超时 / xdotool 缺失，都不该盲发按键
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+            subprocess.Popen(['xdotool', 'key', '--clearmodifiers', 'ctrl+v'],
+                             stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         except Exception:
             pass
@@ -1154,7 +1246,7 @@ class SettingsDialog(object):
             '历史条目上限（50–5000）', '%d' % get_max_items(), 8)
         box.pack_start(row, False, False, 0)
 
-        tip = Gtk.Label(label='改完按回车立即生效')
+        tip = Gtk.Label(label='按回车立即生效，或点「完成」一并保存')
         tip.get_style_context().add_class('settings-value')
         tip.set_xalign(0.0)
         tip.set_margin_top(2)
@@ -1164,7 +1256,7 @@ class SettingsDialog(object):
         btns.set_spacing(12)
         btns.set_margin_top(10)
         btns.pack_start(self._text_button('恢复默认', self._reset), False, False, 0)
-        btns.pack_end(self._text_button('完成', lambda: self.hide()), False, False, 0)
+        btns.pack_end(self._text_button('完成', self._commit_and_close), False, False, 0)
         box.pack_end(btns, False, False, 0)
 
         self.win = win
@@ -1233,6 +1325,12 @@ class SettingsDialog(object):
         else:
             panel.win.set_opacity(get_opacity())
 
+    def _commit_and_close(self):
+        # 点「完成」时也要提交一次：用户很可能改完数字直接点按钮，
+        # 不回车就关掉会静默丢失改动。
+        self._commit()
+        self.hide()
+
     def _reset(self):
         self.font_entry.set_text('%.1f' % DEFAULT_FONT)
         self.op_entry.set_text('100')
@@ -1265,8 +1363,10 @@ class SettingsDialog(object):
 
 class ClipHist(object):
     def __init__(self):
+        _fix_perms()
         self.store = Store(HISTORY_FILE)
         self._own_hash = None       # 自己刚写进剪贴板的内容指纹
+        self._own_timer = None      # 指纹的兜底清除定时器
         self._cap_timer = None      # owner-change 防抖
         self.settings = None
         self.panel = ClipPanel(self)
@@ -1293,6 +1393,7 @@ class ClipHist(object):
         return ('text', item.get('v', ''))
 
     def _clear_own_hash(self):
+        self._own_timer = None
         self._own_hash = None
         return False
 
@@ -1308,7 +1409,7 @@ class ClipHist(object):
         # 富文本与截图会连续触发多次 owner-change，这里做 80ms 防抖，
         # 避免重复拉取剪贴板数据。
         if self._cap_timer:
-            GLib.source_remove(self._cap_timer)
+            return          # 已经排队了，直接等这次捕获（读到的就是最新内容）
         self._cap_timer = GLib.timeout_add(80, self._capture)
 
     def _capture(self):
@@ -1376,7 +1477,7 @@ class ClipHist(object):
         if not ok or not buf or len(buf) > MAX_IMG_BYTES:
             return
         name = 'img_%s.png' % hashlib.md5(buf).hexdigest()[:16]
-        os.makedirs(IMG_DIR, exist_ok=True)
+        os.makedirs(IMG_DIR, mode=0o700, exist_ok=True)
         path = os.path.join(IMG_DIR, name)
         if not os.path.exists(path):
             try:
@@ -1433,7 +1534,9 @@ class ClipHist(object):
         if ok:
             self.store.touch(item)
             self._own_hash = self._fingerprint(item)
-            GLib.timeout_add(2500, self._clear_own_hash)
+            if self._own_timer:
+                GLib.source_remove(self._own_timer)
+            self._own_timer = GLib.timeout_add(2500, self._clear_own_hash)
         return ok
 
     def _set_html(self, doc, plain):
@@ -1555,7 +1658,12 @@ def _send(cmd, timeout=2.0):
 
 
 def _spawn_daemon():
-    # 清掉可能残留在旧 socket（上次异常退出），否则会误判为已启动
+    # 先确认真的没在跑：socket 文件存在不代表服务活着，
+    # 而删掉别人正在用的 socket 会让那个实例变成连不上的孤儿。
+    if _socket_alive():
+        return True
+
+    # 清理上次异常退出留下的死 socket
     try:
         if os.path.exists(SOCK_FILE):
             os.unlink(SOCK_FILE)
@@ -1633,7 +1741,14 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'show'
 
     if cmd == 'daemon':
-        # 强制接管：先请旧实例退出，然后最多等 3 秒让它的窗口自然销毁。
+        # 单实例靠文件锁保证：拿不到锁说明已有实例活着，直接退出。
+        # 比"先删 socket 再抢"可靠——删 socket 会把正在服务的实例踢成孤儿。
+        lock = _try_lock()
+        if lock is None:
+            sys.stderr.write('[cliphist] 已有实例在运行，本次启动放弃\n')
+            return 0
+
+        # 拿到锁之后，残留的 socket 必然是上次异常退出留下的，可以放心清理。
         # 这里**不能**用 XKillClient —— 残留窗口的 resource id 会被新连接复用，
         # 强杀会把自己刚建立的连接一起断掉（Fatal IO error）。
         # 真要清理顽固残留交给 `cliphist stop`（那个进程没有窗口，安全）。
@@ -1648,6 +1763,7 @@ def main():
                 break
             time.sleep(0.1)
         ClipHist().run()
+        return 0
 
     elif cmd in ('show', 'toggle', 'settings'):
         if not _send(cmd):
