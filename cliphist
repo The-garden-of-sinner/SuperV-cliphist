@@ -39,7 +39,13 @@ HOME = os.path.expanduser('~')
 DATA_DIR = os.path.join(HOME, '.local', 'share', 'clip-hist')
 HISTORY_FILE = os.path.join(DATA_DIR, 'history.json')
 IMG_DIR = os.path.join(DATA_DIR, 'images')
-SOCK_FILE = os.path.join(HOME, '.cache', 'clip-hist.sock')
+# socket 优先放在 XDG_RUNTIME_DIR（/run/user/UID，本身是 0700），
+# 不可用则退回 ~/.cache；权限收紧到 0600，避免同机其他用户能给守护进程发指令。
+_RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR') or ''
+if not (_RUNTIME_DIR and os.path.isdir(_RUNTIME_DIR)
+        and os.access(_RUNTIME_DIR, os.W_OK)):
+    _RUNTIME_DIR = os.path.join(HOME, '.cache')
+SOCK_FILE = os.path.join(_RUNTIME_DIR, 'clip-hist.sock')
 
 MAX_ITEMS = 500          # 默认条目上限（可在设置面板里改）
 MAX_CHARS = 200000       # 单条最大字符数，超出不记录
@@ -49,6 +55,9 @@ THUMB_H = 56             # 列表里图片缩略图的目标高度（像素）
 
 IMAGE_TARGETS = {'image/png', 'image/bmp', 'image/jpeg',
                  'image/jpg', 'image/tiff', 'image/webp', 'image/gif'}
+
+MAX_IMG_BYTES = 8 * 1024 * 1024   # 单张图片字节上限，超出不记录
+MAX_IMG_SIDE = 8192                # 单边像素上限，防止超大截图撑爆磁盘
 
 HINT_DEFAULT = '↑↓ 选择    Enter 粘贴    Del 删除    Esc 关闭'
 
@@ -113,7 +122,8 @@ class HotkeyMonitor(threading.Thread):
 
         self._err_cb = CB(_on_x_error)      # 必须持有引用，否则回调被 GC 回收
         x11.XSetErrorHandler.argtypes = [CB]
-        x11.XSetErrorHandler(self._err_cb)
+        x11.XSetErrorHandler.restype = ctypes.c_void_p
+        prev_handler = x11.XSetErrorHandler(self._err_cb)
 
         root = x11.XDefaultRootWindow(dpy)
         keycode = x11.XKeysymToKeycode(dpy, x11.XStringToKeysym(b'v'))
@@ -122,10 +132,18 @@ class HotkeyMonitor(threading.Thread):
         x11.XSelectInput(dpy, root, 1)  # KeyPressMask
         x11.XSync(dpy, 0)
 
+        # 抓完立刻把原来的 handler 还回去。X 的 error handler 是进程级的，
+        # 一直挂着会把 GDK 的 X 错误也一并吞掉，后续排查会更困难。
+        if prev_handler:
+            try:
+                x11.XSetErrorHandler(ctypes.cast(prev_handler, CB))
+            except Exception:
+                pass
+
         self.grab_conflicts = len(errs)
         if self.grab_conflicts:
             sys.stderr.write(
-                '[cliphist] 警告：Win+V 已被其他实例占用（%d/4 个组合抓取失败），'
+                '[cliphist] 警告：Super+V 已被其他实例占用（%d/4 个组合抓取失败），'
                 '本进程将收不到热键。请先运行 cliphist stop。\n'
                 % self.grab_conflicts)
             sys.stderr.flush()
@@ -135,7 +153,7 @@ class HotkeyMonitor(threading.Thread):
         while True:
             x11.XNextEvent(dpy, ctypes.byref(ev))
             if ev.type == KEY_PRESS:
-                now = time.time()
+                now = time.monotonic()
                 if now - self._last < HOTKEY_DELAY_MS / 1000.0:
                     continue
                 self._last = now
@@ -235,11 +253,16 @@ class Store(object):
     def _purge_files(self, item):
         if item.get('k') != 'image':
             return
+        base = os.path.realpath(DATA_DIR)
         for k in ('p', 't'):
             rel = item.get(k)
-            if rel:
+            if not rel:
+                continue
+            p = os.path.realpath(os.path.join(DATA_DIR, rel))
+            # 只删数据目录内的文件：history.json 若被改坏，不至于误删外部路径
+            if p.startswith(base + os.sep) and os.path.isfile(p):
                 try:
-                    os.unlink(os.path.join(DATA_DIR, rel))
+                    os.unlink(p)
                 except Exception:
                     pass
 
@@ -296,19 +319,39 @@ DEFAULT_FONT = 11.0          # pt，接近系统正文 13.5pt 略小一档
 FONT_MIN, FONT_MAX = 8.0, 20.0
 
 
-def load_config():
+_CONFIG_CACHE = None
+
+
+def load_config(force=False):
+    """读取配置。
+
+    默认走内存缓存 —— 列表渲染时每行都会调用 get_show_thumbs()，
+    再叠加每次 push 都要用的 get_max_items()，不缓存的话就是每行/每次复制都开一次文件。
+    force=True 用于 CLI 改完配置后让守护进程重新读盘。
+    """
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None and not force:
+        return dict(_CONFIG_CACHE)
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             c = json.load(f)
-        return c if isinstance(c, dict) else {}
+        _CONFIG_CACHE = c if isinstance(c, dict) else {}
     except Exception:
-        return {}
+        _CONFIG_CACHE = {}
+    return dict(_CONFIG_CACHE)
 
 
 def save_config(c):
+    global _CONFIG_CACHE
+    _CONFIG_CACHE = dict(c)
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(c, f, ensure_ascii=False, indent=2)
+    tmp = CONFIG_FILE + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(c, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+    except Exception:
+        pass
 
 
 def get_num(key, default, lo, hi):
@@ -530,6 +573,7 @@ class ClipPanel(object):
         win.set_focus_on_map(True)
         win.set_default_size(self.WIN_W, self.WIN_H)
         win.get_style_context().add_class('clipwin')
+        win.set_title('cliphist')       # 显式设标题，不依赖 GTK 用程序名兜底
 
         win.connect('delete-event', lambda w, e: (w.hide(), True)[1])
         win.connect('focus-out-event', self._on_focus_out)
@@ -658,8 +702,8 @@ class ClipPanel(object):
 
     def reload_css(self):
         """改字号/透明度后热重载，无需重启进程。"""
+        load_config(force=True)     # CLI 可能刚改过配置文件，这里必须重读
         self._install_css()
-        self.store.load()
         self._rebuild()
         if self._rounded:
             self.win.queue_draw()          # 背景透明度靠重绘生效
@@ -703,23 +747,38 @@ class ClipPanel(object):
         """定位：优先回到上次拖到的位置；首次则贴着鼠标弹出，而不是死板居中。"""
         try:
             screen = self.win.get_screen()
-            mon = screen.get_monitor_geometry(screen.get_primary_monitor())
             w, h = self.WIN_W, self.WIN_H
+
+            mx = my = None
+            disp = None
+            try:
+                disp = Gdk.Display.get_default()
+                _ok, mx, my = disp.get_default_seat().get_pointer().get_position()
+            except Exception:
+                pass
+
+            # 跟随鼠标所在的那块屏幕，多显示器下不会一律弹到主屏
+            mon = None
+            if disp is not None and mx is not None:
+                try:
+                    m = disp.get_monitor_at_point(mx, my)
+                    if m is not None:
+                        mon = m.get_geometry()
+                except Exception:
+                    mon = None
+            if mon is None:
+                mon = screen.get_monitor_geometry(screen.get_primary_monitor())
+
             cfg = load_config()
             px, py = cfg.get('pos_x'), cfg.get('pos_y')
 
             if isinstance(px, (int, float)) and isinstance(py, (int, float)):
                 x, y = int(px), int(py)
+            elif mx is not None:
+                x, y = mx - w // 2, my + 18
             else:
-                # 首次：弹在鼠标右下方，符合"随手唤出"的直觉
                 x = mon.x + (mon.width - w) // 2
                 y = mon.y + int((mon.height - h) * 0.42)
-                try:
-                    seat = Gdk.Display.get_default().get_default_seat()
-                    _ok, mx, my = seat.get_pointer().get_position()
-                    x, y = mx - w // 2, my + 18
-                except Exception:
-                    pass
 
             # 夹在屏幕内，避免上次的位置在换了分辨率后跑到屏幕外
             x = max(mon.x, min(mon.x + mon.width - w, x))
@@ -1012,14 +1071,14 @@ class ClipPanel(object):
         GLib.timeout_add(180, self._send_keys, prev)
 
     def _send_keys(self, prev):
-        cmds = []
+        # 直接 exec xdotool，不再套一层 /bin/sh -c
+        cmd = ['xdotool']
         if prev:
-            cmds.append('xdotool windowactivate --sync %s' % prev)
-        cmds.append('xdotool key --clearmodifiers ctrl+v')
+            cmd += ['windowactivate', '--sync', str(prev)]
+        cmd += ['key', '--clearmodifiers', 'ctrl+v']
         try:
-            subprocess.Popen(['/bin/sh', '-c',
-                              ' ; '.join(cmds)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
         except Exception:
             pass
         return False
@@ -1050,6 +1109,7 @@ class SettingsDialog(object):
         win.set_position(Gtk.WindowPosition.CENTER)
         win.set_default_size(420, 330)
         win.get_style_context().add_class('clipwin')
+        win.set_title('cliphist-settings')
         win.connect('delete-event', lambda w, e: (w.hide(), True)[1])
         win.connect('key-press-event', self._on_key)
 
@@ -1156,6 +1216,9 @@ class SettingsDialog(object):
         cfg['opacity'] = round(op / 100.0, 2)
         cfg['max_items'] = cnt
         save_config(cfg)
+        # 上限调小后立即裁掉多余条目，不用等下一次 push
+        self.app.store._trim()
+        self.app.store.save()
         self.apply()
         self._refill()
         return False
@@ -1303,11 +1366,14 @@ class ClipHist(object):
 
     def _push_image(self, pb):
         """图片落盘（按内容 md5 命名，天然去重）+ 生成缩略图。"""
+        w, h = pb.get_width(), pb.get_height()
+        if w < 3 or h < 3 or w > MAX_IMG_SIDE or h > MAX_IMG_SIDE:
+            return
         try:
             ok, buf = pb.save_to_bufferv('png', [], [])
         except Exception:
             return
-        if not ok or not buf:
+        if not ok or not buf or len(buf) > MAX_IMG_BYTES:
             return
         name = 'img_%s.png' % hashlib.md5(buf).hexdigest()[:16]
         os.makedirs(IMG_DIR, exist_ok=True)
@@ -1424,7 +1490,7 @@ class ClipHist(object):
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(SOCK_FILE)
         try:
-            os.chmod(SOCK_FILE, 0o666)
+            os.chmod(SOCK_FILE, 0o600)
         except Exception:
             pass
         srv.listen(5)
