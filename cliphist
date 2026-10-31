@@ -952,10 +952,13 @@ class ClipPanel(object):
         if k == Gdk.KEY_Escape:
             self.hide()
             return True
-        if k in (Gdk.KEY_Delete, Gdk.KEY_BackSpace) and \
-                (event.state & Gdk.ModifierType.CONTROL_MASK) and k == Gdk.KEY_Delete:
-            self._delete_selected()
-            return True
+        if k == Gdk.KEY_Delete:
+            # 搜索框为空时 Del 直接删条目；有内容时 Del 保持原义（删字符），
+            # 想删条目则用 Ctrl+Del。这样和底部「Del 删除」的提示一致。
+            if (event.state & Gdk.ModifierType.CONTROL_MASK) \
+                    or not self.entry.get_text():
+                self._delete_selected()
+                return True
         return False
 
     def _on_window_key(self, widget, event):
@@ -978,11 +981,16 @@ class ClipPanel(object):
         if not row or not hasattr(row, 'item_data'):
             return
         target = row.item_data
+        idx = row.get_index()
         for i, it in enumerate(self.store.items):
             if it is target:
                 self.store.remove(i)
                 break
         self._rebuild()
+        # 删完把选中落在原位置（或最后一条），方便连续删除
+        rows = [r for r in self.listbox.get_children() if r.get_selectable()]
+        if rows:
+            self.listbox.select_row(rows[min(idx, len(rows) - 1)])
 
     def _on_row_activated(self, lb, row):
         if hasattr(row, 'item_data'):
@@ -998,7 +1006,9 @@ class ClipPanel(object):
             return
         prev = self.prev_window
         self.hide()
-        self.app.set_clipboard(item)
+        if not self.app.set_clipboard(item):
+            # 写剪贴板失败就别发 Ctrl+V 了，否则会把剪贴板里的旧内容粘出去
+            return
         GLib.timeout_add(180, self._send_keys, prev)
 
     def _send_keys(self, prev):
@@ -1193,7 +1203,8 @@ class SettingsDialog(object):
 class ClipHist(object):
     def __init__(self):
         self.store = Store(HISTORY_FILE)
-        self._writing = False
+        self._own_hash = None       # 自己刚写进剪贴板的内容指纹
+        self._cap_timer = None      # owner-change 防抖
         self.settings = None
         self.panel = ClipPanel(self)
         self.settings = SettingsDialog(self)
@@ -1208,14 +1219,37 @@ class ClipHist(object):
 
     # ---- 剪贴板监听 ----
 
+    @staticmethod
+    def _fingerprint(item):
+        """条目指纹，用于识别「这次剪贴板变化是不是自己写进去的」。"""
+        k = item.get('k', 'text')
+        if k == 'image':
+            return ('image', item.get('p', ''))
+        if k == 'html':
+            return ('html', hash(item.get('h', '')))
+        return ('text', item.get('v', ''))
+
+    def _clear_own_hash(self):
+        self._own_hash = None
+        return False
+
+    def _accept(self, item):
+        """入库前先排除自己写入造成的 owner-change，其余照常记录。"""
+        fp = self._fingerprint(item)
+        if self._own_hash is not None and fp == self._own_hash:
+            self._own_hash = None
+            return False
+        return self.store.push_item(item)
+
     def _on_owner_change(self, cb, event):
-        if self._writing:
-            return
-        GLib.timeout_add(60, self._capture)
+        # 富文本与截图会连续触发多次 owner-change，这里做 80ms 防抖，
+        # 避免重复拉取剪贴板数据。
+        if self._cap_timer:
+            GLib.source_remove(self._cap_timer)
+        self._cap_timer = GLib.timeout_add(80, self._capture)
 
     def _capture(self):
-        if self._writing:
-            return False
+        self._cap_timer = None
         try:
             ok, targets = self.clipboard.wait_for_targets()
         except Exception:
@@ -1252,7 +1286,7 @@ class ClipHist(object):
                             plain = self.clipboard.wait_for_text() or ''
                         except Exception:
                             pass
-                        self.store.push_item({
+                        self._accept({
                             'k': 'html',
                             'v': plain or strip_html(doc),
                             'h': doc})
@@ -1264,7 +1298,7 @@ class ClipHist(object):
         except Exception:
             text = None
         if text:
-            self.store.push(text)
+            self._accept({'k': 'text', 'v': text})
         return False
 
     def _push_image(self, pb):
@@ -1301,7 +1335,7 @@ class ClipHist(object):
             except Exception:
                 thumb = name
 
-        self.store.push_item({
+        self._accept({
             'k': 'image',
             'v': '[图片 %d×%d]' % (pb.get_width(), pb.get_height()),
             'p': 'images/' + name,
@@ -1310,25 +1344,31 @@ class ClipHist(object):
             'h': pb.get_height()})
 
     def set_clipboard(self, item):
-        """把条目内容写回剪贴板（文本 / HTML / 图片三种走不同通道）。"""
+        """把条目内容写回剪贴板。返回是否成功，失败时不应当再发 Ctrl+V。"""
         if not isinstance(item, dict):
             item = {'k': 'text', 'v': item or ''}
-        self._writing = True
         kind = item.get('k', 'text')
+        ok = True
         try:
             if kind == 'image':
                 path = os.path.join(DATA_DIR, item.get('p', ''))
                 pb = GdkPixbuf.Pixbuf.new_from_file(path)
-                self.clipboard.set_image(pb)
+                if pb is None:
+                    ok = False
+                else:
+                    self.clipboard.set_image(pb)
             elif kind == 'html' and item.get('h'):
                 self._set_html(item['h'], item.get('v', ''))
             else:
                 self.clipboard.set_text(item.get('v', ''), -1)
         except Exception:
-            pass
-        self.store.touch(item)
-        GLib.timeout_add(600, self._clear_writing)
-        return False
+            ok = False
+
+        if ok:
+            self.store.touch(item)
+            self._own_hash = self._fingerprint(item)
+            GLib.timeout_add(2500, self._clear_own_hash)
+        return ok
 
     def _set_html(self, doc, plain):
         """同时提供 text/html 与纯文本，让目标应用自行择优。
@@ -1358,8 +1398,11 @@ class ClipHist(object):
         except (AttributeError, TypeError):
             self.clipboard.set_text(plain or strip_html(doc), -1)
 
-    def _clear_writing(self):
-        self._writing = False
+    def _on_ipc_clear(self):
+        """IPC 来的清空请求：必须回主线程执行，否则与 GTK 线程的 push 撞车。"""
+        self.store.clear()
+        if self.panel.is_visible():
+            self.panel._rebuild()
         return False
 
     def open_settings(self):
@@ -1402,7 +1445,7 @@ class ClipHist(object):
                     elif data == 'quit':
                         GLib.idle_add(Gtk.main_quit)
                     elif data == 'clear':
-                        self.store.clear()
+                        GLib.idle_add(self._on_ipc_clear)
                     elif data == 'reload':
                         GLib.idle_add(self.panel.reload_css)
                     elif data == 'settings':
@@ -1584,9 +1627,10 @@ def main():
                   % (get_font_size(), FONT_MIN, FONT_MAX))
 
     elif cmd == 'clear':
-        s = Store(HISTORY_FILE)
-        s.clear()
-        _send('clear')
+        # 守护进程在跑时必须交给它清空。否则它内存里仍是旧数据，
+        # 下一次 push 会把整个文件覆盖回去（表现为「清空后记录又复活」）。
+        if not _send('clear'):
+            Store(HISTORY_FILE).clear()
         print('历史已清空')
 
     else:
