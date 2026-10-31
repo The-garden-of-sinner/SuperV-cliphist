@@ -1,16 +1,22 @@
 # SuperV-cliphist
 
-> X11 桌面环境下的剪贴板历史面板。单文件实现，仅依赖系统自带组件。
+**按下 `Super+V`，把复制过的东西原样叫回来。**  
+纯文本、富文本、图片、文件四类内容，单文件实现，不依赖任何第三方包。
 
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-
-![GTK](https://img.shields.io/badge/GTK-3.24-4a86cf)
-
-![Platform](https://img.shields.io/badge/platform-X11-lightgrey)
-
-![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![GTK](https://img.shields.io/badge/GTK-3.24-4a86cf) ![Platform](https://img.shields.io/badge/platform-X11-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ![screenshot](screenshot.png)
+
+## 亮点
+
+- **装得上** —— 一个脚本文件，依赖只有系统自带的 GTK3 与 libX11。
+  `apt` 被锁死、装不了 CopyQ 的机器，复制文件即可用。
+- **粘得回** —— 四类内容都按原格式写回：带格式的段落粘进 WPS 仍是带格式的，
+  文件粘进文件管理器仍然是文件，图片仍是原图。
+- **写得省** —— 历史存 SQLite 并增量写入。同等数据量下，单次保存的写盘量约为
+  JSON 全量重写的 1/170，延迟从 68 ms 降到 0.2 ms。
+- **扛得住** —— 界面进程崩溃后由父进程在 1–5 秒内拉起；
+  热键抓取失败会重试并清理残留实例；库损坏时自动隔离并用快照恢复。
 
 ## 关于修饰键的命名
 
@@ -51,21 +57,22 @@ Windows 系统中该组合键记作 `Win+V`，对应键盘左下角印有 Window
 ## 与 CopyQ 的对比
 
 CopyQ 是该领域最成熟的项目（12k+ star，15 年迭代），功能覆盖显著超过本项目。  
-两者定位不同：本项目以单文件实现换取最低的部署成本，面向软件源受限、以纯文本处理为主的场景；  
-界面与配置项保持精简，安装完成即可使用，常驻开销约 50 MB。
+两者定位不同：本项目以单文件实现换取最低的部署成本，把「复制—粘贴」这条主链路做完整；
+CopyQ 覆盖面更广，固定条目、标签、脚本、正则搜索都是它更强。
 
-下表按部署成本、交互方式与功能覆盖三个维度对比，优势项标记 ✅：
+下表按部署成本、交互方式与资源开销对比，优势项标记 ✅：
 
 | 维度      | SuperV-cliphist      | CopyQ                       |
 | ------- | -------------------- | --------------------------- |
-| 部署方式    | 复制单个文件               | 13 个 Qt5 依赖，约 5 MB          |
-| 运行时依赖   | 均为系统自带组件             | 需安装 Qt5 运行时                 |
-| 全局热键    | ✅ 内置，安装即生效           | 默认未绑定，需在设置中添加 <sup>1</sup> |
-| 开机自启    | ✅ 安装时自动配置            | 需在设置中手动启用 <sup>1</sup>      |
-| 交互流程    | ✅ 呼出即可粘贴回原窗口         | 需配置方可达到相近效果                 |
-| 常驻内存    | 约 50 MB <sup>2</sup> | 约 70 MB <sup>2</sup>        |
-| 国产发行版适配 | ✅ 针对 UKUI / X11 调校   | 通用实现                        |
-| 设置界面    | 面板内三项核心参数            | ✅ 完整 GUI 设置面板               |
+| 部署方式    | ✅ 复制单个文件            | 13 个 Qt5 依赖，约 5 MB          |
+| 运行时依赖   | ✅ 均为系统自带组件          | 需安装 Qt5 运行时                 |
+| 全局热键    | ✅ 内置，安装即生效          | 默认未绑定，需在设置中添加 <sup>1</sup> |
+| 开机自启    | ✅ 安装时自动配置           | 需在设置中手动启用 <sup>1</sup>      |
+| 交互流程    | ✅ 呼出即可粘贴回原窗口        | 需配置方可达到相近效果                 |
+| 常驻内存    | ✅ 约 53 MB <sup>2</sup> | 约 70 MB <sup>2</sup>       |
+| 写入开销    | ✅ 单条约 12 KB（SQLite 增量） | 未实测                      |
+| 国产发行版适配 | ✅ 针对 UKUI / X11 调校  | 通用实现                        |
+| 设置界面    | 面板内三项核心参数           | ✅ 完整 GUI 设置面板               |
 | 富文本格式保留 | ✅ 粘贴时保留样式 <sup>3</sup> | ✅                           |
 | 图片缩略图   | -                    | ✅                           |
 | 固定条目与标签 | -                    | ✅                           |
@@ -75,7 +82,7 @@ CopyQ 是该领域最成熟的项目（12k+ star，15 年迭代），功能覆�
 > **1** — CopyQ 官方文档将「未设置全局快捷键」与「未启用开机自启」列为常见配置疏漏，  
 > 两项均需在 `File → Preferences` 中手动开启。
 >
-> **2** — 内存数据：本项目为同机实测 RSS（含热键线程与剪贴板监听）；  
+> **2** — 内存为同机实测 RSS：本项目 53 MB（含热键线程、剪贴板监听与 SQLite 缓存）；  
 > CopyQ 为同类 Qt5 程序的空载基准推算，未实际安装验证，仅供参考。
 >
 > **3** — 通过 ctypes 直接调用 GTK 的 `gtk_clipboard_set_with_data` 实现，
@@ -160,9 +167,11 @@ cliphist stop       # 停止守护进程
 数据目录 `~/.local/share/clip-hist/`：
 
 ```
-history.json     # 条目数据（文本 / HTML / 文件路径 / 图片元信息）
-images/          # 图片原图与缩略图，按内容 md5 命名
-daemon.log       # 界面进程的 stderr，崩溃原因写在这里（超过 256 KB 轮转）
+history.db             # 条目数据（SQLite，WAL 模式）
+history.json.migrated  # 从 JSON 迁移前的原始文件，保留用于回滚
+snapshots/             # 每 72 小时一份可读 JSON 快照，保留最近 3 份
+images/                # 图片原图与缩略图，按内容 md5 命名
+daemon.log             # 界面进程的 stderr，崩溃原因写在这里（超过 256 KB 轮转）
 ```
 
 ## 已知限制
@@ -180,13 +189,35 @@ daemon.log       # 界面进程的 stderr，崩溃原因写在这里（超过 25
    用来避免富文本与截图连续触发多次 owner-change 时重复入库；  
    窗口内发生多次复制时，只能记录到窗口结束时剪贴板里的内容。
 
+## 存储
+
+历史存放在 `history.db`（SQLite，WAL + `synchronous=NORMAL`）。
+
+同机实测，500 条 × 2000 字符（约 2.1 MB）：
+
+| 方案 | 每次写盘 | 写延迟（中位） | 读全量 |
+|---|---|---|---|
+| JSON 全量重写 + 原子替换 | 2119 KB | 68 ms | 32 ms |
+| SQLite 增量写 | 12 KB | 0.2 ms | 21 ms |
+
+写放大差约 170 倍。剪贴板每复制一次就保存一次，条目里长文本越多，
+全量重写的代价越明显；SQLite 只写变化的那几页。
+
+首次启动会自动把旧 `history.json` 导入，原文件改名为
+`history.json.migrated` **保留**。需要回滚时删掉 `history.db` 即可。
+
+运行期每 72 小时导出一份可读 JSON 快照到 `snapshots/`，只保留最近 3 份。
+库损坏时会把损坏文件改名为 `history.db.corrupt-<时间戳>`，
+再用最近一份快照恢复。
+
 ## 实现说明
 
 - **全局热键**：通过 `ctypes` 调用 libX11 的 `XGrabKey`，运行于独立线程与独立 Display 连接，  
   避免与 GTK 共用连接。需同时抓取 CapsLock / NumLock 的四种组合，  
   否则锁定键开启时热键失效。
 - **热键冲突检测**：通过 `XSetErrorHandler` 统计抓取失败次数，热键被其他实例占用时输出告警。  
-  Xlib 默认静默失败，缺失该检测将难以定位问题。
+  Xlib 默认静默失败，缺失该检测将难以定位问题。崩溃重启后会重试 3 秒；
+  仍然失败则断开残留的 cliphist 客户端再试一次。
 - **单实例控制**：Unix socket 探测存活状态，`XKillClient` 清理跨 PID namespace 的残留进程。  
   `XKillClient` 不可置于启动流程中 —— 残留窗口的 resource id 会被新连接复用，  
   强制断开将同时中断新建立的连接。

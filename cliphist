@@ -21,6 +21,7 @@ import time
 import fcntl
 import socket
 import urllib.parse
+import sqlite3
 import ctypes
 import hashlib
 import signal
@@ -250,6 +251,17 @@ class HotkeyMonitor(threading.Thread):
             time.sleep(0.3)
             conflicts = _grab_once()
 
+        if conflicts:
+            # 三次都失败，多半是上次崩溃留下的孤儿实例还占着键。
+            # 此刻本进程尚未创建任何窗口，断开别人不会误伤自己。
+            killed = kill_stale_clients()
+            if killed:
+                sys.stderr.write('[cliphist] 已断开 %d 个残留实例，重试抓键\n'
+                                 % killed)
+                sys.stderr.flush()
+                time.sleep(0.4)
+                conflicts = _grab_once()
+
         # 抓完立刻把原来的 handler 还回去。X 的 error handler 是进程级的，
         # 一直挂着会把 GDK 的 X 错误也一并吞掉，后续排查会更困难。
         if prev_handler:
@@ -282,8 +294,8 @@ class HotkeyMonitor(threading.Thread):
 # 历史存取
 # --------------------------------------------------------------------------
 
-class Store(object):
-    """历史存储。条目结构：
+class JsonStore(object):
+    """JSON 存储（旧格式，保留作为 sqlite 不可用时的兜底）。条目结构：
        纯文本  {"k":"text",  "v":文本, "ts":...}
        富文本  {"k":"html",  "v":纯文本回退, "h":html, "ts":...}
        图片    {"k":"image", "v":"[图片 W×H]", "p":原图, "t":缩略图,
@@ -515,6 +527,444 @@ class Store(object):
         for it in snapshot:
             self._purge_files(it)
         return True
+
+
+SNAPSHOT_DIR = os.path.join(DATA_DIR, 'snapshots')
+SNAPSHOT_INTERVAL = 72 * 3600      # 每 72 小时导出一份可读快照
+SNAPSHOT_KEEP = 3                  # 只保留最近 3 份
+
+
+def _unique_backup(path, suffix):
+    """给 path 生成一个不覆盖已有文件的备份名，并改名过去。返回新路径或 None。"""
+    try:
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        bak = '%s.%s-%s' % (path, suffix, stamp)
+        n = 1
+        while os.path.exists(bak):
+            bak = '%s.%s-%s-%d' % (path, suffix, stamp, n)
+            n += 1
+        os.replace(path, bak)
+        return bak
+    except Exception:
+        return None
+
+
+class SqliteStore(object):
+    """SQLite 存储。
+
+    对外接口与 JsonStore 完全一致（items / push_item / touch / remove /
+    clear / _trim / save / _purge_files），差别只在写入方式：
+    JSON 每次全量重写整份历史，条目越长写放越大；sqlite 只写变化的那几页。
+
+    内存里仍保留一份列表供面板搜索与渲染，条目多带一个 _id 指向数据库行。
+    _id 不会写进快照，快照就是一份可以直接读的 JSON。
+    """
+
+    def __init__(self, path, legacy_json=None):
+        self.path = path                 # history.db
+        self.legacy_json = legacy_json   # 旧 history.json，迁移成功后改名留档
+        self.items = []
+        self.readonly = False
+        self.dirty = False
+        self._seq = 0
+        self._uid = 0
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        self.conn = None
+        try:
+            self.conn = self._connect()
+            self._prepare()
+        except sqlite3.DatabaseError as e:
+            # 连 PRAGMA 都执行不了：文件损坏或根本不是数据库。
+            # 先留档，再重建，最后尽量用快照把数据捞回来。
+            self._quarantine_db(e)
+            self.conn = self._connect()
+            self._create_schema()
+            self._restore_latest_snapshot()
+            self.load()
+        except Exception:
+            try:
+                if self.conn is not None:
+                    self.conn.close()
+            except Exception:
+                pass
+            raise
+
+    # ---- 连接与建表 ----
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA busy_timeout=3000')
+        for suffix in ('', '-wal', '-shm'):
+            try:
+                os.chmod(self.path + suffix, 0o600)
+            except Exception:
+                pass
+        return conn
+
+    def _prepare(self):
+        try:
+            verdict = self.conn.execute('PRAGMA integrity_check').fetchone()[0]
+        except Exception as e:
+            verdict = 'error: %s' % e
+        if verdict != 'ok':
+            # 库自身坏了：改名留档，尝试用最近一份快照重建
+            self._quarantine_db(verdict)
+            self.conn = self._connect()
+            self._create_schema()
+            self._restore_latest_snapshot()
+            self.load()
+            return
+
+        self._create_schema()
+        self._migrate_from_json()
+        self.load()
+        self._maybe_snapshot()
+
+    def _quarantine_db(self, reason):
+        """把损坏的库与 WAL 文件改名留档，绝不直接删。"""
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
+        bak = _unique_backup(self.path, 'corrupt')
+        for suffix in ('-wal', '-shm'):
+            try:
+                os.unlink(self.path + suffix)
+            except Exception:
+                pass
+        sys.stderr.write('[cliphist] 历史库损坏（%s），已另存为 %s\n'
+                         % (reason, bak))
+        sys.stderr.flush()
+        return bak
+
+    def _create_schema(self):
+        self.conn.execute('''CREATE TABLE IF NOT EXISTS items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ukey TEXT NOT NULL,
+            k TEXT NOT NULL,
+            v TEXT,
+            htext TEXT,
+            p TEXT,
+            tpath TEXT,
+            w INTEGER,
+            ih INTEGER,
+            ts REAL NOT NULL,
+            seq INTEGER NOT NULL)''')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_items_ukey ON items(ukey)')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_items_seq ON items(seq)')
+        self.conn.commit()
+
+    # ---- 迁移与快照 ----
+
+    @staticmethod
+    def _ukey(it):
+        k = it.get('k', 'text')
+        if k == 'image':
+            raw = it.get('p', '')
+        elif k == 'html':
+            raw = it.get('h', '')
+        else:
+            raw = it.get('v', '')
+        return k + ':' + hashlib.md5(
+            (raw or '').encode('utf-8', 'ignore')).hexdigest()
+
+    def _migrate_from_json(self):
+        try:
+            if self.conn.execute('SELECT COUNT(*) FROM items').fetchone()[0]:
+                return
+        except Exception:
+            return
+        src = self.legacy_json
+        if not src or not os.path.isfile(src):
+            return
+        try:
+            with open(src, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError('root is not a list')
+        except (ValueError, UnicodeDecodeError) as e:
+            # 内容坏了：改名留档，绝不静默丢弃
+            bak = _unique_backup(src, 'corrupt')
+            sys.stderr.write('[cliphist] 旧历史无法解析（%s），已另存为 %s\n'
+                             % (e, bak))
+            sys.stderr.flush()
+            return
+        except OSError as e:
+            # 读不动（权限/占用）：什么都不动，下次再迁
+            sys.stderr.write('[cliphist] 旧历史读取失败（%s），本次不迁移\n' % e)
+            sys.stderr.flush()
+            return
+
+        rows = [x for x in data
+                if isinstance(x, dict) and ('v' in x or 'h' in x)]
+        seq = 0
+        for it in reversed(rows):        # 旧列表是「新→旧」，反着插才是正序
+            seq += 1
+            k = it.get('k', 'text')
+            try:
+                self.conn.execute(
+                    'INSERT INTO items(ukey,k,v,htext,p,tpath,w,ih,ts,seq)'
+                    ' VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    (self._ukey(it), k, it.get('v', ''),
+                     it.get('h') if k == 'html' else None,
+                     it.get('p'), it.get('t'),
+                     it.get('w') if k == 'image' else None,
+                     it.get('h') if k == 'image' else None,
+                     float(it.get('ts') or time.time()), seq))
+            except Exception:
+                continue
+        self.conn.commit()
+        self._seq = seq
+
+        # 迁移完成：旧文件改名留档，而不是删除
+        try:
+            os.replace(src, src + '.migrated')
+        except Exception:
+            pass
+        sys.stderr.write('[cliphist] 已迁移 %d 条历史到 sqlite，'
+                         '原文件保留为 history.json.migrated\n' % seq)
+        sys.stderr.flush()
+
+    def _maybe_snapshot(self):
+        try:
+            os.makedirs(SNAPSHOT_DIR, mode=0o700, exist_ok=True)
+            names = sorted(n for n in os.listdir(SNAPSHOT_DIR)
+                           if n.endswith('.json'))
+            newest = 0.0
+            if names:
+                newest = os.path.getmtime(os.path.join(SNAPSHOT_DIR, names[-1]))
+            if time.time() - newest < SNAPSHOT_INTERVAL:
+                return
+            path = os.path.join(SNAPSHOT_DIR,
+                                'history-%s.json' % time.strftime('%Y%m%d-%H%M'))
+            if not os.path.exists(path):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump([{k: v for k, v in it.items() if k != '_id'}
+                               for it in self.items], f, ensure_ascii=False)
+            names = sorted(n for n in os.listdir(SNAPSHOT_DIR)
+                           if n.endswith('.json'))
+            for old in names[:-SNAPSHOT_KEEP]:
+                try:
+                    os.unlink(os.path.join(SNAPSHOT_DIR, old))
+                except Exception:
+                    pass
+        except Exception as e:
+            sys.stderr.write('[cliphist] 快照失败：%s\n' % e)
+            sys.stderr.flush()
+
+    def _restore_latest_snapshot(self):
+        """库损坏后，用最近一份快照把数据捞回来。返回是否恢复成功。"""
+        try:
+            names = sorted(n for n in os.listdir(SNAPSHOT_DIR)
+                           if n.endswith('.json'))
+        except Exception:
+            return False
+        for name in reversed(names):
+            try:
+                with open(os.path.join(SNAPSHOT_DIR, name),
+                          'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if not isinstance(data, list):
+                    continue
+                seq = 0
+                for it in reversed(data):
+                    if not isinstance(it, dict):
+                        continue
+                    seq += 1
+                    k = it.get('k', 'text')
+                    self.conn.execute(
+                        'INSERT INTO items(ukey,k,v,htext,p,tpath,w,ih,ts,seq)'
+                        ' VALUES(?,?,?,?,?,?,?,?,?,?)',
+                        (self._ukey(it), k, it.get('v', ''),
+                         it.get('h') if k == 'html' else None,
+                         it.get('p'), it.get('t'),
+                         it.get('w') if k == 'image' else None,
+                         it.get('h') if k == 'image' else None,
+                         float(it.get('ts') or time.time()), seq))
+                self.conn.commit()
+                self._seq = seq
+                sys.stderr.write('[cliphist] 已从快照 %s 恢复 %d 条\n'
+                                 % (name, seq))
+                sys.stderr.flush()
+                return True
+            except Exception:
+                continue
+        return False
+
+    # ---- 读写 ----
+
+    def load(self):
+        if self.dirty:
+            sys.stderr.write('[cliphist] 存在未保存的改动，跳过重新读取历史库\n')
+            sys.stderr.flush()
+            return
+        rows = self.conn.execute(
+            'SELECT id,k,v,htext,p,tpath,w,ih,ts,seq FROM items'
+            ' ORDER BY seq DESC').fetchall()
+        self.items = []
+        for r in rows:
+            _id, k, v, htext, p, tpath, w, ih, ts, seq = r
+            it = {'_id': _id, 'k': k or 'text', 'v': v or '',
+                  'ts': ts or time.time()}
+            if k == 'html':
+                if htext:
+                    it['h'] = htext
+            elif k == 'image':
+                if p:
+                    it['p'] = p
+                if tpath:
+                    it['t'] = tpath
+                if w is not None:
+                    it['w'] = w
+                if ih is not None:
+                    it['h'] = ih
+            self.items.append(it)
+        self._seq = max([0] + [r[9] for r in rows])
+        self.readonly = False
+
+    def save(self):
+        if self.readonly:
+            self.dirty = True
+            return False
+        try:
+            self.conn.commit()
+            self.dirty = False
+            return True
+        except Exception as e:
+            sys.stderr.write('[cliphist] 历史保存失败：%s\n' % e)
+            sys.stderr.flush()
+            # 必须回滚：否则未提交的 DELETE/INSERT 会留在事务里，
+            # 下一次 commit 时被一并执行，内存与磁盘就对不上了
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            self.dirty = True
+            self.readonly = True     # 再写也是失败，先停手，避免反复报错
+            return False
+
+    def _next_seq(self):
+        self._seq += 1
+        return self._seq
+
+    def push(self, text):
+        return self.push_item({'k': 'text', 'v': text})
+
+    def push_item(self, item):
+        v = item.get('v', '') or ''
+        if item.get('k') != 'image':
+            v = v.replace('\x00', '')
+            if len(v) > MAX_CHARS or not v.strip():
+                return False
+            item['v'] = v
+        item['ts'] = time.time()
+        uk = self._ukey(item)
+
+        try:
+            row = self.conn.execute('SELECT id FROM items WHERE ukey=? LIMIT 1',
+                                    (uk,)).fetchone()
+        except Exception:
+            row = None
+
+        if row:
+            _id = row[0]
+            self.conn.execute('UPDATE items SET seq=?, ts=? WHERE id=?',
+                              (self._next_seq(), item['ts'], _id))
+            for i, it in enumerate(self.items):
+                if it.get('_id') == _id:
+                    old = self.items.pop(i)
+                    old['ts'] = item['ts']
+                    self.items.insert(0, old)
+                    break
+            self.save()
+            return True
+
+        k = item.get('k', 'text')
+        cur = self.conn.execute(
+            'INSERT INTO items(ukey,k,v,htext,p,tpath,w,ih,ts,seq)'
+            ' VALUES(?,?,?,?,?,?,?,?,?,?)',
+            (uk, k, item.get('v', ''),
+             item.get('h') if k == 'html' else None,
+             item.get('p'), item.get('t'),
+             item.get('w') if k == 'image' else None,
+             item.get('h') if k == 'image' else None,
+             item['ts'], self._next_seq()))
+        item['_id'] = cur.lastrowid
+        self.items.insert(0, item)
+        dropped = self._trim()
+        if self.save():
+            for it in dropped:
+                self._purge_files(it)
+        return True
+
+    def touch(self, item):
+        for i, it in enumerate(self.items):
+            if it is item:
+                if i != 0:
+                    self.items.pop(i)
+                    self.items.insert(0, it)
+                it['ts'] = time.time()
+                if it.get('_id'):
+                    self.conn.execute('UPDATE items SET seq=?, ts=? WHERE id=?',
+                                      (self._next_seq(), it['ts'], it['_id']))
+                self.save()
+                return
+
+    def _trim(self):
+        limit = get_max_items()
+        if len(self.items) <= limit:
+            return []
+        dropped = self.items[limit:]
+        del self.items[limit:]
+        ids = [(it['_id'],) for it in dropped if it.get('_id')]
+        if ids:
+            try:
+                self.conn.executemany('DELETE FROM items WHERE id=?', ids)
+            except Exception:
+                pass
+        return dropped
+
+    def remove(self, index):
+        if not (0 <= index < len(self.items)):
+            return False
+        snapshot = list(self.items)
+        removed = self.items.pop(index)
+        if removed.get('_id'):
+            self.conn.execute('DELETE FROM items WHERE id=?', (removed['_id'],))
+        if not self.save():
+            self.items[:] = snapshot
+            return False
+        self._purge_files(removed)
+        return True
+
+    def clear(self):
+        snapshot = list(self.items)
+        self.items = []
+        self.conn.execute('DELETE FROM items')
+        if not self.save():
+            self.items = snapshot
+            return False
+        for it in snapshot:
+            self._purge_files(it)
+        return True
+
+    # 与 JsonStore 共用同一套图片清理规则
+    _purge_files = JsonStore._purge_files
+
+
+def Store(path):
+    """按可用性选择后端：优先 sqlite，失败则回退到 JSON。"""
+    db = os.path.join(os.path.dirname(path), 'history.db')
+    try:
+        return SqliteStore(db, legacy_json=path)
+    except Exception as e:
+        sys.stderr.write('[cliphist] sqlite 存储不可用（%s），回退到 JSON 文件\n' % e)
+        sys.stderr.flush()
+        return JsonStore(path)
 
 
 def _fix_perms():
@@ -1973,8 +2423,19 @@ class ClipHist(object):
 
         threading.Thread(target=loop, daemon=True).start()
 
+    def _snapshot_tick(self):
+        try:
+            if hasattr(self.store, '_maybe_snapshot'):
+                self.store._maybe_snapshot()
+        except Exception:
+            pass
+        return True
+
     def run(self):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, Gtk.main_quit)
+        # 每小时检查一次快照是否到期：只靠启动时检查的话，
+        # 长期不重启的守护进程永远不会有第二份快照
+        GLib.timeout_add_seconds(3600, self._snapshot_tick)
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, Gtk.main_quit)
         Gtk.main()
         try:
