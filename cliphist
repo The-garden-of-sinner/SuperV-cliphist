@@ -99,6 +99,11 @@ IMAGE_TARGETS = {'image/png', 'image/bmp', 'image/jpeg',
 MAX_IMG_BYTES = 8 * 1024 * 1024   # 单张图片字节上限，超出不记录
 MAX_IMG_SIDE = 8192                # 单边像素上限，防止超大截图撑爆磁盘
 
+# 图片相对路径的合法形式（history.json 里就存这个）：
+# images/img_<md5 前16位>.png 及其缩略图 images/th_img_<...>.png。
+# 清理文件前用它做第一道校验，避免历史被改坏后删到别的文件。
+IMG_REL_RE = re.compile(r'^images/(?:th_)?img_[0-9a-f]{16}\.png$')
+
 HINT_DEFAULT = '↑↓ 选择    Enter 粘贴    Del 删除    Esc 关闭'
 
 
@@ -218,9 +223,17 @@ class Store(object):
         self.items = []
         # 隔离失败时置 True：宁可本次不写盘，也不能用空列表覆盖掉原文件
         self.readonly = False
+        # 内存中有尚未落盘的改动。此时绝不能从磁盘重读，否则改动凭空消失
+        self.dirty = False
         self.load()
 
     def load(self):
+        if self.dirty:
+            # 内存里有没写成功的条目，重读磁盘会把它们抹掉。
+            # 保留内存状态，等下一次 save() 有机会再落盘。
+            sys.stderr.write('[cliphist] 存在未保存的改动，跳过重新读取历史文件\n')
+            sys.stderr.flush()
+            return
         try:
             with open(self.path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -282,6 +295,7 @@ class Store(object):
         if self.readonly:
             sys.stderr.write('[cliphist] 处于只读状态（历史文件此前读取失败），跳过保存\n')
             sys.stderr.flush()
+            self.dirty = True
             return False
         d = os.path.dirname(self.path)
         try:
@@ -295,10 +309,12 @@ class Store(object):
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(self.items, f, ensure_ascii=False)
             os.replace(tmp, self.path)
+            self.dirty = False
             return True
         except Exception as e:
             sys.stderr.write('[cliphist] 历史保存失败：%s\n' % e)
             sys.stderr.flush()
+            self.dirty = True
             try:
                 os.unlink(tmp)
             except Exception:
@@ -369,20 +385,37 @@ class Store(object):
         return dropped
 
     def _purge_files(self, item):
+        """删除条目引用的图片文件。
+
+        历史文件是可以被改坏的：只校验「在数据目录内」时，一条
+        p="history.json" 的伪图片记录就能把历史自己删掉；而
+        images/img_x.png 若是个指向别的图片的符号链接，先 realpath
+        再判断会把链接目标当成待删文件。因此这里的校验顺序是：
+
+        1. 相对路径必须严格是 images/(th_)img_<16位小写hex>.png
+        2. 原始候选路径不能是符号链接（realpath 之前判断）
+        3. 解析后的真实路径必须落在 IMG_DIR 内
+        4. 必须存在且是普通文件
+        """
         if item.get('k') != 'image':
             return
-        base = os.path.realpath(DATA_DIR)
+        base = os.path.realpath(IMG_DIR)
         for k in ('p', 't'):
             rel = item.get(k)
-            if not rel:
-                continue
-            p = os.path.realpath(os.path.join(DATA_DIR, rel))
-            # 只删数据目录内的文件：history.json 若被改坏，不至于误删外部路径
-            if p.startswith(base + os.sep) and os.path.isfile(p):
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
+            if not isinstance(rel, str) or not IMG_REL_RE.match(rel):
+                continue                      # 路径格式不对，一律不碰
+            raw = os.path.join(DATA_DIR, rel)
+            if os.path.islink(raw):
+                continue                      # 原路径就是符号链接，拒绝
+            p = os.path.realpath(raw)
+            if not p.startswith(base + os.sep):
+                continue                      # 解析后跑出图片目录
+            if os.path.islink(p) or not os.path.isfile(p):
+                continue                      # 二次确认（防竞态）
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
     def remove(self, index):
         if not (0 <= index < len(self.items)):
@@ -1434,7 +1467,8 @@ class SettingsDialog(object):
     def apply(self):
         panel = self.app.panel
         panel._install_css()
-        panel.store.load()
+        # 不重读历史：运行期内存里的 items 就是最新状态，
+        # 重读会把「写盘失败、仅存于内存」的条目直接抹掉。
         panel._rebuild()
         if panel._rounded:
             panel.win.queue_draw()
