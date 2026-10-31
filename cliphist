@@ -41,6 +41,7 @@ HOME = os.path.expanduser('~')
 DATA_DIR = os.path.join(HOME, '.local', 'share', 'clip-hist')
 HISTORY_FILE = os.path.join(DATA_DIR, 'history.json')
 IMG_DIR = os.path.join(DATA_DIR, 'images')
+DAEMON_LOG = os.path.join(DATA_DIR, 'daemon.log')   # 子进程 stderr 落盘处
 # socket 优先放在 XDG_RUNTIME_DIR（/run/user/UID，本身是 0700），
 # 不可用则退回 ~/.cache；权限收紧到 0600，避免同机其他用户能给守护进程发指令。
 _RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR') or ''
@@ -104,6 +105,63 @@ MAX_IMG_SIDE = 8192                # 单边像素上限，防止超大截图撑�
 # images/img_<md5 前16位>.png 及其缩略图 images/th_img_<...>.png。
 # 清理文件前用它做第一道校验，避免历史被改坏后删到别的文件。
 IMG_REL_RE = re.compile(r'^images/(?:th_)?img_[0-9a-f]{16}\.png$')
+
+
+# --------------------------------------------------------------------------
+# 剪贴板多格式写回（PyGObject 未绑定 gtk_clipboard_set_with_data）
+# --------------------------------------------------------------------------
+
+class _GtkTargetEntry(ctypes.Structure):
+    _fields_ = [('target', ctypes.c_char_p),
+                ('flags', ctypes.c_uint),
+                ('info', ctypes.c_uint)]
+
+
+_CLIP_GET_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.c_uint, ctypes.c_void_p)
+_CLIP_CLEAR_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+_CLIP_API = None
+
+
+def gtk_clipboard_api():
+    """惰性准备 ctypes 版的多格式剪贴板接口；不可用时返回 None。
+
+    为什么不用 PyGObject：3.36 的 Gtk.Clipboard 只绑定了 set_text / set_image。
+    写入 text/html、text/uri-list 需要 gtk_clipboard_set_with_data，
+    它接收 C 函数指针，GI 无法自动转换；而 Gtk.Clipboard.__gpointer__
+    是个 NULL PyCapsule，也拿不到对象地址。
+    所以从 C 侧用 gtk_clipboard_get(CLIPBOARD) 取同一个单例指针。
+    """
+    global _CLIP_API
+    if _CLIP_API is not None:
+        return _CLIP_API or None
+    try:
+        gtk = ctypes.CDLL('libgtk-3.so.0')
+        gdk = ctypes.CDLL('libgdk-3.so.0')
+
+        gdk.gdk_atom_intern.restype = ctypes.c_void_p
+        gdk.gdk_atom_intern.argtypes = [ctypes.c_char_p, ctypes.c_int]
+
+        gtk.gtk_clipboard_get.restype = ctypes.c_void_p
+        gtk.gtk_clipboard_get.argtypes = [ctypes.c_void_p]
+
+        gtk.gtk_clipboard_set_with_data.restype = None
+        gtk.gtk_clipboard_set_with_data.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_GtkTargetEntry), ctypes.c_uint,
+            _CLIP_GET_FUNC, _CLIP_CLEAR_FUNC, ctypes.c_void_p]
+
+        gtk.gtk_selection_data_set.restype = ctypes.c_int
+        gtk.gtk_selection_data_set.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_int]
+
+        ptr = gtk.gtk_clipboard_get(gdk.gdk_atom_intern(b'CLIPBOARD', 0))
+        if not ptr:
+            raise RuntimeError('gtk_clipboard_get 返回空')
+        _CLIP_API = (gtk, gdk, ptr)
+    except Exception:
+        _CLIP_API = False        # 记下失败，避免每次重试
+    return _CLIP_API or None
 
 HINT_DEFAULT = '↑↓ 选择    Enter 粘贴    Del 删除    Esc 关闭'
 
@@ -173,10 +231,24 @@ class HotkeyMonitor(threading.Thread):
 
         root = x11.XDefaultRootWindow(dpy)
         keycode = x11.XKeysymToKeycode(dpy, x11.XStringToKeysym(b'v'))
-        for extra in LOCK_VARIANTS:
-            x11.XGrabKey(dpy, keycode, MOD_SUPER | extra, root, 1, 1, 1)
-        x11.XSelectInput(dpy, root, 1)  # KeyPressMask
-        x11.XSync(dpy, 0)
+
+        def _grab_once():
+            del errs[:]
+            for extra in LOCK_VARIANTS:
+                x11.XGrabKey(dpy, keycode, MOD_SUPER | extra, root, 1, 1, 1)
+            x11.XSelectInput(dpy, root, 1)  # KeyPressMask
+            x11.XSync(dpy, 0)
+            return len(errs)
+
+        # 崩溃重启时，上一个进程的 grab 可能还没被 X 服务端完全释放，
+        # 第一次抓取会 4/4 失败。那时进程照旧"运行中"，但热键是死的——
+        # 所以这里重试几秒，而不是抓到什么算什么。
+        conflicts = _grab_once()
+        for _ in range(10):
+            if conflicts == 0:
+                break
+            time.sleep(0.3)
+            conflicts = _grab_once()
 
         # 抓完立刻把原来的 handler 还回去。X 的 error handler 是进程级的，
         # 一直挂着会把 GDK 的 X 错误也一并吞掉，后续排查会更困难。
@@ -186,11 +258,11 @@ class HotkeyMonitor(threading.Thread):
             except Exception:
                 pass
 
-        self.grab_conflicts = len(errs)
+        self.grab_conflicts = conflicts
         if self.grab_conflicts:
             sys.stderr.write(
                 '[cliphist] 警告：Super+V 已被其他实例占用（%d/4 个组合抓取失败），'
-                '本进程将收不到热键。请先运行 cliphist stop。\n'
+                '本进程将收不到热键。请先运行 cliphist stop 再启动。\n'
                 % self.grab_conflicts)
             sys.stderr.flush()
         self.started_ok = True
@@ -329,6 +401,8 @@ class Store(object):
             return ('image', it.get('p', ''))
         if k == 'html':
             return ('html', it.get('h', ''))
+        if k == 'file':
+            return ('file', it.get('v', ''))
         return ('text', it.get('v', ''))
 
     def push(self, text):
@@ -1548,6 +1622,7 @@ class ClipHist(object):
         self._own_hash = None       # 自己刚写进剪贴板的内容指纹
         self._own_timer = None      # 指纹的兜底清除定时器
         self._cap_timer = None      # owner-change 防抖
+        self._clip_keeps = []       # 多格式写入的回调与数据（防 GC，按次保留）
         self.settings = None
         self.panel = ClipPanel(self)
         self.settings = SettingsDialog(self)
@@ -1570,6 +1645,8 @@ class ClipHist(object):
             return ('image', item.get('p', ''))
         if k == 'html':
             return ('html', hash(item.get('h', '')))
+        if k == 'file':
+            return ('file', item.get('v', ''))
         return ('text', item.get('v', ''))
 
     def _clear_own_hash(self):
@@ -1713,7 +1790,8 @@ class ClipHist(object):
             item = {'k': 'text', 'v': item or ''}
         kind = item.get('k', 'text')
         ok = True
-        wrote_html = False
+        wrote_native = False     # 是否真的写入了多格式（而不是降级成纯文本）
+        written_text = item.get('v', '') or ''
         try:
             if kind == 'image':
                 path = os.path.join(DATA_DIR, item.get('p', ''))
@@ -1723,20 +1801,26 @@ class ClipHist(object):
                 else:
                     self.clipboard.set_image(pb)
             elif kind == 'html' and item.get('h'):
-                wrote_html = self._set_html(item['h'], item.get('v', ''))
+                written_text = item.get('v') or strip_html(item['h'])
+                wrote_native = self._set_html(item['h'], written_text)
+            elif kind == 'file':
+                paths = [p for p in (item.get('v') or '').splitlines() if p]
+                if not paths:
+                    ok = False
+                else:
+                    wrote_native = self._set_files(paths)
             else:
-                self.clipboard.set_text(item.get('v', ''), -1)
+                self.clipboard.set_text(written_text, -1)
         except Exception:
             ok = False
 
         if ok:
             self.store.touch(item)
-            # 指纹必须按「实际写进剪贴板的形式」算。
-            # _set_html 降级成纯文本时，如果仍按 HTML 算指纹，
+            # 指纹必须按「实际写进剪贴板的形式」算：
+            # 多格式写入失败降级成纯文本时，若仍按原类型算，
             # 随后捕获到的那段纯文本会被当成新内容再入库一次。
-            if kind == 'html' and item.get('h') and not wrote_html:
-                self._own_hash = ('text', item.get('v') or
-                                  strip_html(item['h']))
+            if kind in ('html', 'file') and not wrote_native:
+                self._own_hash = ('text', written_text)
             else:
                 self._own_hash = self._fingerprint(item)
             if self._own_timer:
@@ -1744,38 +1828,87 @@ class ClipHist(object):
             self._own_timer = GLib.timeout_add(2500, self._clear_own_hash)
         return ok
 
-    def _set_html(self, doc, plain):
-        """同时提供 text/html 与纯文本，让目标应用自行择优。
+    def _set_multi(self, payloads):
+        """一次写入多种剪贴板格式。payloads 为 [(target, bytes), ...]。
 
-        返回 True 表示确实写入了 text/html；False 表示走了纯文本降级
-        （调用方需要据此调整自身写入的指纹）。
-
-        注意：PyGObject 3.36 没有绑定 gtk_clipboard_set_with_data，
-        所以这里带降级——拿不到多格式接口时只写纯文本，内容不丢、格式会丢。
+        返回实际写入的首选格式名；接口不可用或调用失败时返回 None。
+        调用方必须能接受降级——这里只负责试，不负责兜底。
         """
-        entries = [
-            Gtk.TargetEntry.new('text/html', 0, 0),
-            Gtk.TargetEntry.new('UTF8_STRING', 0, 1),
-            Gtk.TargetEntry.new('text/plain;charset=utf-8', 0, 1),
-            Gtk.TargetEntry.new('text/plain', 0, 1),
-        ]
-
-        def _get(_cb, selection, info, _data):
-            if info == 0:
-                selection.set(Gdk.Atom.intern('text/html', False), 8,
-                              doc.encode('utf-8'))
-            else:
-                selection.set_text(plain, -1)
-
-        def _clear(_cb, _data):
-            pass
-
+        api = gtk_clipboard_api()
+        if api is None:
+            return None
+        gtk, gdk, ptr = api
         try:
-            self.clipboard.set_with_data(entries, _get, _clear, None)
+            entries = (_GtkTargetEntry * len(payloads))(*[
+                _GtkTargetEntry(t.encode('ascii'), 0, i)
+                for i, (t, _b) in enumerate(payloads)])
+            names = [t for t, _b in payloads]
+            blobs = [b for _t, b in payloads]
+
+            def on_get(_c, sel, info, _d):
+                if info >= len(blobs):
+                    return
+                atom = gdk.gdk_atom_intern(names[info].encode('ascii'), 0)
+                data = blobs[info]
+                gtk.gtk_selection_data_set(sel, atom, 8, data, len(data))
+
+            # 回调与数据必须一直持有：一旦被 GC，GTK 下次来取就是野指针。
+            # 用**列表**而不是单个引用：写入新内容时 GTK 会先对旧数据调用
+            # clear，如果 clear 里把当前引用置空，新写入的那份就被连带丢掉，
+            # 之后任何应用来取数据都会踩空。
+            keep = [entries, blobs, None, None]
+
+            def on_clear(_c, _d):
+                try:
+                    self._clip_keeps.remove(keep)
+                except ValueError:
+                    pass
+
+            get_cb = _CLIP_GET_FUNC(on_get)
+            clear_cb = _CLIP_CLEAR_FUNC(on_clear)
+            keep[2], keep[3] = get_cb, clear_cb
+            self._clip_keeps.append(keep)
+            gtk.gtk_clipboard_set_with_data(ptr, entries, len(payloads),
+                                            get_cb, clear_cb, None)
+            return names[0]
+        except Exception:
+            return None
+
+    def _set_html(self, doc, plain):
+        """写入 text/html + 纯文本。返回 True 表示 HTML 真的写进去了。"""
+        plain = plain or strip_html(doc)
+        got = self._set_multi([
+            ('text/html', doc.encode('utf-8')),
+            ('UTF8_STRING', plain.encode('utf-8')),
+            ('text/plain;charset=utf-8', plain.encode('utf-8')),
+            ('text/plain', plain.encode('utf-8')),
+        ])
+        if got:
             return True
-        except (AttributeError, TypeError):
-            self.clipboard.set_text(plain or strip_html(doc), -1)
+        self.clipboard.set_text(plain, -1)
+        return False
+
+    def _set_files(self, paths):
+        """写入 text/uri-list，让文件管理器能真正粘贴出文件。"""
+        paths = [p for p in paths if p]
+        if not paths:
             return False
+        text = '\n'.join(paths)
+        uris = ['file://' + urllib.parse.quote(p) for p in paths]
+        uri_blob = ('\r\n'.join(uris) + '\r\n').encode('utf-8')
+        # GNOME/Nautilus 系还认这个私有格式，一并给上
+        gnome = ('copy\n' + '\n'.join(uris)).encode('utf-8')
+        got = self._set_multi([
+            ('text/uri-list', uri_blob),
+            ('x-special/gnome-copied-files', gnome),
+            ('UTF8_STRING', text.encode('utf-8')),
+            ('text/plain;charset=utf-8', text.encode('utf-8')),
+            ('text/plain', text.encode('utf-8')),
+        ])
+        if got:
+            return True
+        self.clipboard.set_text(text, -1)
+        return False
 
     def _on_ipc_clear(self):
         """IPC 来的清空请求：必须回主线程执行，否则与 GTK 线程的 push 撞车。"""
@@ -1951,17 +2084,34 @@ def _supervise():
     每次重绘都要经 MIT-SHM 把位图上传给 X；而这条通道在这台机器上会间歇性
     报 BadValue 并直接把进程打掉（request_code 130 / minor_code 3）。
     这是环境缺陷，应用层无法绕开，但可以让它自动回来——
-    否则按 Win+V 没反应，且用户不知道要去重启。
+    否则按 Super+V 没反应，且用户不知道要去重启。
+
+    子进程的 stderr 追加到 daemon.log：崩溃原因（Gdk-ERROR / traceback）
+    都在里面，否则守护启动方式一变，日志就跟着丢了。
     """
     restarts = 0
+    try:                     # 日志超过 256 KB 就轮转一份，避免无限增长
+        if os.path.getsize(DAEMON_LOG) > 256 * 1024:
+            os.replace(DAEMON_LOG, DAEMON_LOG + '.1')
+    except Exception:
+        pass
     while True:
         pid = os.fork()
         if pid == 0:
             # 子进程：只跑界面与剪贴板，不碰锁（锁由父进程持有）
+            try:
+                fd = os.open(DAEMON_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                             0o600)
+                os.dup2(fd, 2)
+                os.close(fd)
+            except Exception:
+                pass
             code = 0
             try:
                 ClipHist().run()
             except BaseException:
+                import traceback
+                traceback.print_exc()
                 code = 1
             os._exit(code)
 
@@ -1970,17 +2120,22 @@ def _supervise():
         except OSError:
             return 1
 
-        if os.WIFEXITED(status):
-            return os.WEXITSTATUS(status)   # 正常退出（quit / stop），父进程跟着退
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            return 0        # 正常退出（quit / stop），父进程跟着退
 
-        sig = os.WTERMSIG(status)
+        if os.WIFSIGNALED(status):
+            why = 'signal %d' % os.WTERMSIG(status)
+        else:
+            why = 'exit %d' % os.WEXITSTATUS(status)
+
         restarts += 1
-        sys.stderr.write('[cliphist] 界面进程异常退出（signal %d），第 %d 次重启\n'
-                         % (sig, restarts))
+        sys.stderr.write('[cliphist] 界面进程异常退出（%s），第 %d 次重启\n'
+                         % (why, restarts))
         sys.stderr.flush()
         if restarts > 30:
             sys.stderr.write('[cliphist] 连续崩溃过多，停止重启；'
-                             '可执行 cliphist daemon 手动再启动\n')
+                             '详见 %s，可执行 cliphist daemon 手动再启动\n'
+                             % DAEMON_LOG)
             sys.stderr.flush()
             return 1
         time.sleep(min(1.0 * restarts, 5.0))
