@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=剪贴板历史
+Name[zh_CN]=剪贴板历史
+Comment=按 Win+V 呼出剪贴板历史面板
+Exec=%h/.local/bin/cliphist daemon
+Icon=edit-paste
+Terminal=false
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3
+StartupNotify=false

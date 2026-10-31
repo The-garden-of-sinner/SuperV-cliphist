@@ -1,0 +1,1599 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+cliphist — Win+V 风格的剪贴板历史面板（银河麒麟 / UKUI / X11）
+
+零第三方依赖：仅使用系统自带的 GTK3 与 libX11。
+    常驻进程：  cliphist daemon
+    手动呼出：  cliphist show
+    停止：      cliphist stop
+    状态：      cliphist status
+    清空历史：  cliphist clear
+    调字号：    cliphist font <8-20>      （单位 pt，改完立即生效）
+"""
+
+import os
+import re
+import sys
+import json
+import math
+import time
+import socket
+import ctypes
+import hashlib
+import signal
+import threading
+import subprocess
+
+try:
+    import cairo
+except Exception:
+    cairo = None
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+from gi.repository import Gtk, Gdk, GLib, Pango, GdkPixbuf
+
+HOME = os.path.expanduser('~')
+DATA_DIR = os.path.join(HOME, '.local', 'share', 'clip-hist')
+HISTORY_FILE = os.path.join(DATA_DIR, 'history.json')
+IMG_DIR = os.path.join(DATA_DIR, 'images')
+SOCK_FILE = os.path.join(HOME, '.cache', 'clip-hist.sock')
+
+MAX_ITEMS = 500          # 默认条目上限（可在设置面板里改）
+MAX_CHARS = 200000       # 单条最大字符数，超出不记录
+MAX_RENDER = 80          # 列表最多渲染多少行，防止几百张图片把 UI 拖死
+HOTKEY_DELAY_MS = 300    # 热键节流
+THUMB_H = 56             # 列表里图片缩略图的目标高度（像素）
+
+IMAGE_TARGETS = {'image/png', 'image/bmp', 'image/jpeg',
+                 'image/jpg', 'image/tiff', 'image/webp', 'image/gif'}
+
+HINT_DEFAULT = '↑↓ 选择    Enter 粘贴    Del 删除    Esc 关闭'
+
+
+# --------------------------------------------------------------------------
+# X11 全局热键（ctypes 直接调用 libX11，无需 python-xlib）
+# --------------------------------------------------------------------------
+
+class _XEvent(ctypes.Union):
+    _fields_ = [('type', ctypes.c_int), ('pad', ctypes.c_long * 24)]
+
+
+MOD_SUPER = 64                     # Mod4Mask
+LOCK_VARIANTS = (0, 2, 16, 18)     # 无锁定 / CapsLock / NumLock / 两者
+KEY_PRESS = 2
+
+
+class HotkeyMonitor(threading.Thread):
+    """在独立 X 连接上抓取 Super+V，触发时回调。"""
+
+    daemon = True
+
+    def __init__(self, callback):
+        super().__init__(name='hotkey')
+        self.callback = callback
+        self.started_ok = False
+        self._last = 0.0
+
+    def run(self):
+        try:
+            x11 = ctypes.CDLL('libX11.so.6')
+        except OSError:
+            return
+
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XStringToKeysym.restype = ctypes.c_ulong
+        x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+        x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XGrabKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint,
+                                 ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+        x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return
+        self._x11 = x11
+
+        # 抓取失败（已被别的客户端占用）时 Xlib 会抛 BadAccess，必须捕获并计数，
+        # 否则进程静默活着却不响应热键，排查起来极其费劲。
+        errs = []
+        CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _on_x_error(_d, _e):
+            errs.append(1)
+            return 0
+
+        self._err_cb = CB(_on_x_error)      # 必须持有引用，否则回调被 GC 回收
+        x11.XSetErrorHandler.argtypes = [CB]
+        x11.XSetErrorHandler(self._err_cb)
+
+        root = x11.XDefaultRootWindow(dpy)
+        keycode = x11.XKeysymToKeycode(dpy, x11.XStringToKeysym(b'v'))
+        for extra in LOCK_VARIANTS:
+            x11.XGrabKey(dpy, keycode, MOD_SUPER | extra, root, 1, 1, 1)
+        x11.XSelectInput(dpy, root, 1)  # KeyPressMask
+        x11.XSync(dpy, 0)
+
+        self.grab_conflicts = len(errs)
+        if self.grab_conflicts:
+            sys.stderr.write(
+                '[cliphist] 警告：Win+V 已被其他实例占用（%d/4 个组合抓取失败），'
+                '本进程将收不到热键。请先运行 cliphist stop。\n'
+                % self.grab_conflicts)
+            sys.stderr.flush()
+        self.started_ok = True
+
+        ev = _XEvent()
+        while True:
+            x11.XNextEvent(dpy, ctypes.byref(ev))
+            if ev.type == KEY_PRESS:
+                now = time.time()
+                if now - self._last < HOTKEY_DELAY_MS / 1000.0:
+                    continue
+                self._last = now
+                GLib.idle_add(self.callback)
+
+
+# --------------------------------------------------------------------------
+# 历史存取
+# --------------------------------------------------------------------------
+
+class Store(object):
+    """历史存储。条目结构：
+       纯文本  {"k":"text",  "v":文本, "ts":...}
+       富文本  {"k":"html",  "v":纯文本回退, "h":html, "ts":...}
+       图片    {"k":"image", "v":"[图片 W×H]", "p":原图, "t":缩略图,
+                "w":宽, "h":高, "ts":...}
+       'k' 缺省按 text 处理，兼容旧版数据。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.items = []
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.items = [x for x in data
+                              if isinstance(x, dict) and ('v' in x or 'h' in x)]
+        except Exception:
+            self.items = []
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.items, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _key(it):
+        k = it.get('k', 'text')
+        if k == 'image':
+            return ('image', it.get('p', ''))
+        if k == 'html':
+            return ('html', it.get('h', ''))
+        return ('text', it.get('v', ''))
+
+    def push(self, text):
+        """插入一条纯文本；同内容已存在则置顶。"""
+        return self.push_item({'k': 'text', 'v': text})
+
+    def push_item(self, item):
+        v = item.get('v', '') or ''
+        if item.get('k') != 'image':
+            v = v.replace('\x00', '')
+            if len(v) > MAX_CHARS or not v.strip():
+                return False
+            item['v'] = v
+        item['ts'] = time.time()
+
+        key = self._key(item)
+        for i, it in enumerate(self.items):
+            if self._key(it) == key:
+                old = self.items.pop(i)
+                old['ts'] = item['ts']
+                self.items.insert(0, old)
+                self.save()
+                return True
+
+        self.items.insert(0, item)
+        self._trim()
+        self.save()
+        return True
+
+    def touch(self, item):
+        """把条目置顶并刷新时间（面板里粘贴后调用）。"""
+        for i, it in enumerate(self.items):
+            if it is item:
+                if i != 0:
+                    self.items.pop(i)
+                    self.items.insert(0, it)
+                it['ts'] = time.time()
+                self.save()
+                return
+
+    def _trim(self):
+        limit = get_max_items()
+        while len(self.items) > limit:
+            self._purge_files(self.items.pop())
+
+    def _purge_files(self, item):
+        if item.get('k') != 'image':
+            return
+        for k in ('p', 't'):
+            rel = item.get(k)
+            if rel:
+                try:
+                    os.unlink(os.path.join(DATA_DIR, rel))
+                except Exception:
+                    pass
+
+    def remove(self, index):
+        if 0 <= index < len(self.items):
+            self._purge_files(self.items.pop(index))
+            self.save()
+
+    def clear(self):
+        for it in self.items:
+            self._purge_files(it)
+        self.items = []
+        self.save()
+
+
+def human_time(ts):
+    d = max(0, time.time() - ts)
+    if d < 60:
+        return '刚刚'
+    if d < 3600:
+        return '%d 分钟前' % int(d // 60)
+    if d < 86400:
+        return '%d 小时前' % int(d // 3600)
+    if d < 86400 * 7:
+        return '%d 天前' % int(d // 86400)
+    return time.strftime('%m-%d', time.localtime(ts))
+
+
+def preview(text, limit=300):
+    s = ' '.join(text.split())
+    if len(s) > limit:
+        s = s[:limit] + '…'
+    return s
+
+
+def strip_html(html):
+    """从 HTML 提取可读的纯文本，作为搜索与列表显示的兜底。"""
+    import html as _h
+    t = re.sub(r'(?is)<(script|style)\b.*?</\1>', ' ', html or '')
+    t = re.sub(r'(?s)<[^>]+>', ' ', t)
+    try:
+        t = _h.unescape(t)
+    except Exception:
+        pass
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+# --------------------------------------------------------------------------
+# 界面
+# --------------------------------------------------------------------------
+
+CONFIG_FILE = os.path.join(HOME, '.config', 'clip-hist', 'config.json')
+DEFAULT_FONT = 11.0          # pt，接近系统正文 13.5pt 略小一档
+FONT_MIN, FONT_MAX = 8.0, 20.0
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(c):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(c, f, ensure_ascii=False, indent=2)
+
+
+def get_num(key, default, lo, hi):
+    try:
+        v = float(load_config().get(key, default))
+    except Exception:
+        return float(default)
+    return max(lo, min(hi, v))
+
+
+def get_font_size():
+    return get_num('font_size', DEFAULT_FONT, FONT_MIN, FONT_MAX)
+
+
+def get_max_items():
+    return int(get_num('max_items', MAX_ITEMS, 50, 5000))
+
+
+def get_opacity():
+    return get_num('opacity', 1.0, 0.5, 1.0)
+
+
+def get_show_thumbs():
+    """是否在列表里画缩略图。
+
+    默认关闭：部分环境的 GDK 走 MIT-SHM 传位图会报 BadValue 并直接把进程打崩
+    （本机实测 ShmPutImage 必崩），关掉后列表只显示 [图片 W×H] 文字，稳定优先。
+    环境正常的话可以在设置里打开。
+    """
+    return bool(load_config().get('show_thumbs', False))
+
+
+def get_argb():
+    """是否启用 ARGB 视觉（圆角 + 半透明背景）。
+
+    默认关闭。ARGB 窗口是 32 位视觉，GTK 每次重绘都要把整窗位图经 MIT-SHM
+    上传给 X server；本环境这条路是坏的（ShmPutImage → BadValue → 进程崩），
+    而输入框光标闪烁每秒都在触发重绘，所以崩溃只是时间问题。
+    关掉后是普通 24 位不透明窗口：没有圆角，但稳定。
+    """
+    return bool(load_config().get('argb', False))
+
+
+BASE_CSS = """
+.clipwin {
+    background-color: #ffffff;
+    border: 1px solid rgba(0,0,0,0.16);
+    border-radius: 12px;
+}
+.panel {
+    background-color: #ffffff;
+    border: 2px solid #9aa3ad;
+    border-radius: 10px;
+}
+.panel-trans {
+    background-color: transparent;
+    border: none;
+}
+.search {
+    background-color: #f4f5f7;
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-size: __FS__pt;
+    color: #1f2328;
+    min-height: 22px;
+}
+.search:focus {
+    border: 1px solid #3b82f6;
+    background-color: #ffffff;
+}
+.item {
+    border-radius: 7px;
+    padding: 8px 10px;
+}
+.item:hover {
+    background-color: #f1f3f5;
+}
+/* 选中高亮改由条目自己画（带圆角）；行本身保持透明，
+   否则主题会给整行铺一块矩形底色，盖住条目的圆角 */
+row:selected,
+row:selected:hover,
+row:selected:focus {
+    background-color: transparent;
+    border: none;
+}
+row:selected .item,
+row:selected .item:hover {
+    background-color: #dce9fd;
+    border-radius: 7px;
+}
+.item-title {
+    font-size: __FS__pt;
+    color: #1f2328;
+}
+.item-time {
+    font-size: __FS_S__pt;
+    color: #98a1ab;
+}
+.hint {
+    font-size: __FS_S__pt;
+    color: #9aa3ad;
+}
+.empty {
+    font-size: __FS__pt;
+    color: #a0a8b0;
+}
+.head {
+    font-size: __FS_H__pt;
+    color: #8b949e;
+}
+.draghint {
+    font-size: __FS_S__pt;
+    color: #c0c6cc;
+}
+.badge {
+    font-size: __FS_S__pt;
+    color: #5b6673;
+    background-color: #eef1f4;
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+.gearbtn {
+    padding: 1px 8px;
+    border-radius: 5px;
+    border: none;
+    background-color: transparent;
+    color: #5b6673;
+    font-size: __FS_S__pt;
+}
+.gearbtn:hover {
+    background-color: #eef1f4;
+    color: #1f2328;
+}
+.settings-title {
+    font-size: __FS_H__pt;
+    color: #5b6673;
+}
+.settings-label {
+    font-size: __FS__pt;
+    color: #1f2328;
+}
+.settings-value {
+    font-size: __FS_S__pt;
+    color: #6b7785;
+}
+.btn {
+    padding: 4px 12px;
+    border-radius: 6px;
+    color: #1a6fd4;
+    font-size: __FS__pt;
+}
+"""
+
+
+def build_css(fs):
+    """按基准字号生成 CSS；正文 = fs，辅助 = 0.8fs，小标题 = 0.9fs。"""
+    s = (BASE_CSS
+         .replace('__FS_S__', '%.1f' % (fs * 0.80))
+         .replace('__FS_H__', '%.1f' % (fs * 0.90))
+         .replace('__FS__', '%.1f' % fs))
+    return s.encode('utf-8')
+
+
+def draw_panel_bg(widget, cr):
+    """自绘圆角面板底：可调透明度的白底 + 细边框（主面板与设置窗共用）。"""
+    alloc = widget.get_allocation()
+    w, h = alloc.width, alloc.height
+    r = 12.0
+    alpha = get_opacity()
+
+    cr.set_operator(cairo.OPERATOR_CLEAR)
+    cr.paint()
+    cr.set_operator(cairo.OPERATOR_SOURCE)
+
+    cr.new_sub_path()
+    cr.arc(w - r - 0.5, r + 0.5, r, -math.pi / 2, 0)
+    cr.arc(w - r - 0.5, h - r - 0.5, r, 0, math.pi / 2)
+    cr.arc(r + 0.5, h - r - 0.5, r, math.pi / 2, math.pi)
+    cr.arc(r + 0.5, r + 0.5, r, math.pi, 1.5 * math.pi)
+    cr.close_path()
+
+    cr.set_source_rgba(1.0, 1.0, 1.0, alpha)
+    cr.fill_preserve()
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.18 * alpha)
+    cr.set_line_width(1.0)
+    cr.stroke()
+    cr.set_operator(cairo.OPERATOR_OVER)
+    return False
+
+
+class ClipPanel(object):
+    WIN_W = 500
+    WIN_H = 620
+
+    def __init__(self, app):
+        self.app = app
+        self.store = app.store
+        self.visible_items = []
+        self.prev_window = None
+        self.win = None
+        self._pos_timer = None
+        self._build()
+
+    # ---------------- 构建 ----------------
+
+    def _build(self):
+        self._provider = None
+        self._install_css()
+
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_keep_above(True)
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        win.set_accept_focus(True)
+        win.set_focus_on_map(True)
+        win.set_default_size(self.WIN_W, self.WIN_H)
+        win.get_style_context().add_class('clipwin')
+
+        win.connect('delete-event', lambda w, e: (w.hide(), True)[1])
+        win.connect('focus-out-event', self._on_focus_out)
+        win.connect('key-press-event', self._on_window_key)
+        win.connect('configure-event', self._on_configure)
+
+        # 有 ARGB 视觉时用 cairo 自绘圆角；否则退化为不透明白底矩形。
+        # 默认不走 ARGB —— 见 get_argb() 的说明，本环境走 32 位视觉会崩。
+        self._rounded = False
+        if cairo is not None and get_argb():
+            try:
+                visual = win.get_screen().get_rgba_visual()
+                if visual is not None:
+                    win.set_visual(visual)
+                    win.set_app_paintable(True)
+                    win.connect('draw', self._on_draw)
+                    self._rounded = True
+            except Exception:
+                self._rounded = False
+
+        # EventBox 有独立绘制窗口，背景色能稳定落在面板上
+        # 窗口本身是矩形，CSS 圆角只在内部面板上生效，四角会露出窗口底色。
+        # 把底色设成与边框同色，圆角看起来就连贯了。
+        try:
+            win.override_background_color(
+                Gtk.StateFlags.NORMAL,
+                Gdk.RGBA(0x9a / 255.0, 0xa3 / 255.0, 0xad / 255.0, 1.0))
+        except Exception:
+            pass
+
+        eb = Gtk.EventBox()
+        eb.get_style_context().add_class(
+            'panel-trans' if self._rounded else 'panel')
+        if not self._rounded:
+            eb.override_background_color(Gtk.StateFlags.NORMAL,
+                                         Gdk.RGBA(1.0, 1.0, 1.0, 1.0))
+        else:
+            eb.override_background_color(Gtk.StateFlags.NORMAL,
+                                         Gdk.RGBA(1.0, 1.0, 1.0, 0.0))
+        win.add(eb)
+
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        frame.set_spacing(0)
+        eb.add(frame)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(10)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
+        outer.set_spacing(9)
+        frame.pack_start(outer, True, True, 0)
+
+        # 标题行：包一层 EventBox，按住即可拖动窗口
+        head_eb = Gtk.EventBox()
+        head_eb.connect('button-press-event', self._on_title_press)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        title = Gtk.Label(label='剪贴板历史')
+        title.get_style_context().add_class('head')
+        head.pack_start(title, False, False, 2)
+        drag_hint = Gtk.Label(label='按住可拖动')
+        drag_hint.get_style_context().add_class('draghint')
+        head.pack_end(drag_hint, False, False, 4)
+        head_eb.add(head)
+        outer.pack_start(head_eb, False, False, 0)
+
+        # 搜索框
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text('搜索剪贴板历史…')
+        self.entry.get_style_context().add_class('search')
+        self.entry.connect('changed', self._on_search)
+        self.entry.connect('key-press-event', self._on_entry_key)
+        outer.pack_start(self.entry, False, False, 0)
+
+        # 列表
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        scroll.set_vexpand(True)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_activate_on_single_click(True)
+        self.listbox.set_can_focus(False)
+        self.listbox.connect('row-activated', self._on_row_activated)
+        scroll.add(self.listbox)
+        self.scroll = scroll
+        outer.pack_start(scroll, True, True, 0)
+
+        # 底部操作栏：提示 + 设置齿轮
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bar.set_spacing(6)
+        self.hint = Gtk.Label(label=HINT_DEFAULT)
+        self.hint.get_style_context().add_class('hint')
+        self.hint.set_xalign(0.0)
+        self.hint.set_ellipsize(Pango.EllipsizeMode.END)
+        self.hint.set_width_chars(1)
+        bar.pack_start(self.hint, True, True, 0)
+
+        # 用 EventBox+Label 而不是 Gtk.Button：按钮的边框在 UKUI 主题下是位图资源，
+        # 本环境位图上传（MIT-SHM）会崩，Label 是纯矢量，安全。
+        gear = Gtk.EventBox()
+        gear.set_tooltip_text('字号 / 透明度 / 条目数')
+        glbl = Gtk.Label(label='设置')
+        glbl.get_style_context().add_class('gearbtn')
+        gear.add(glbl)
+        gear.connect('button-release-event',
+                     lambda w, e: (self._open_settings(), True)[1])
+        bar.pack_end(gear, False, False, 0)
+
+        outer.pack_start(bar, False, False, 0)
+
+        self.win = win
+
+    def _open_settings(self, *_):
+        self.app.open_settings()
+
+    def _install_css(self):
+        screen = Gdk.Screen.get_default()
+        if self._provider is not None:
+            Gtk.StyleContext.remove_provider_for_screen(screen, self._provider)
+        self._provider = Gtk.CssProvider()
+        self._provider.load_from_data(build_css(get_font_size()))
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, self._provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def reload_css(self):
+        """改字号/透明度后热重载，无需重启进程。"""
+        self._install_css()
+        self.store.load()
+        self._rebuild()
+        if self._rounded:
+            self.win.queue_draw()          # 背景透明度靠重绘生效
+        else:
+            self.win.set_opacity(get_opacity())
+        return False
+
+    def _on_draw(self, widget, cr):
+        if not self._rounded:
+            return False
+        return draw_panel_bg(widget, cr)
+
+    # ---------------- 显示 / 隐藏 ----------------
+
+    def is_visible(self):
+        return self.win.get_visible()
+
+    def toggle(self):
+        if self.is_visible():
+            self.hide()
+        else:
+            self.show()
+
+    def show(self):
+        self.store.load()
+        self.prev_window = self._active_window()
+        self.entry.set_text('')
+        self._rebuild()
+        self.win.show_all()
+        self._place()          # 必须在 map 之后再定位，否则 WM 忽略
+        self.win.present()
+        self._shown_at = time.time()
+        self.entry.grab_focus()
+        if self.visible_items:
+            self.listbox.select_row(self.listbox.get_row_at_index(0))
+
+    def hide(self):
+        self.win.hide()
+
+    def _place(self):
+        """定位：优先回到上次拖到的位置；首次则贴着鼠标弹出，而不是死板居中。"""
+        try:
+            screen = self.win.get_screen()
+            mon = screen.get_monitor_geometry(screen.get_primary_monitor())
+            w, h = self.WIN_W, self.WIN_H
+            cfg = load_config()
+            px, py = cfg.get('pos_x'), cfg.get('pos_y')
+
+            if isinstance(px, (int, float)) and isinstance(py, (int, float)):
+                x, y = int(px), int(py)
+            else:
+                # 首次：弹在鼠标右下方，符合"随手唤出"的直觉
+                x = mon.x + (mon.width - w) // 2
+                y = mon.y + int((mon.height - h) * 0.42)
+                try:
+                    seat = Gdk.Display.get_default().get_default_seat()
+                    _ok, mx, my = seat.get_pointer().get_position()
+                    x, y = mx - w // 2, my + 18
+                except Exception:
+                    pass
+
+            # 夹在屏幕内，避免上次的位置在换了分辨率后跑到屏幕外
+            x = max(mon.x, min(mon.x + mon.width - w, x))
+            y = max(mon.y, min(mon.y + mon.height - h, y))
+            self.win.move(x, y)
+        except Exception:
+            pass
+
+    def _on_title_press(self, widget, event):
+        """按住标题栏拖动窗口。"""
+        if event.button == 1:
+            try:
+                self.win.begin_move_drag(event.button, int(event.x_root),
+                                         int(event.y_root), event.time)
+            except Exception:
+                pass
+            return True
+        return False
+
+    def _on_configure(self, widget, event):
+        """窗口被移动后记下位置（防抖，避免拖动过程中频繁写盘）。"""
+        if not self.win.get_visible():
+            return False
+        if self._pos_timer:
+            GLib.source_remove(self._pos_timer)
+        self._pos_timer = GLib.timeout_add(
+            600, self._save_pos, event.x, event.y)
+        return False
+
+    def _save_pos(self, x, y):
+        self._pos_timer = None
+        cfg = load_config()
+        cfg['pos_x'] = int(x)
+        cfg['pos_y'] = int(y)
+        save_config(cfg)
+        return False
+
+    def _active_window(self):
+        try:
+            out = subprocess.check_output(
+                ['xdotool', 'getactivewindow'], stderr=subprocess.DEVNULL)
+            return out.decode().strip()
+        except Exception:
+            return None
+
+    def _on_focus_out(self, w, e):
+        # 点击别处自动收起（给 250ms 宽限，避免刚弹出就被误判）
+        GLib.timeout_add(250, self._hide_if_unfocused)
+        return False
+
+    def _hide_if_unfocused(self):
+        if not self.win.get_visible():
+            return False
+        if time.time() - getattr(self, '_shown_at', 0) < 0.35:
+            return False
+        if not self.win.is_active():
+            self.hide()
+        return False
+
+    # ---------------- 列表 ----------------
+
+    def _rebuild(self):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+
+        kw = self.entry.get_text().strip().lower()
+        items = self.store.items
+        if kw:
+            items = [it for it in items if kw in it.get('v', '').lower()]
+        total = len(items)
+        if total > MAX_RENDER:      # 图片行含缩略图，一次渲染太多会明显卡顿
+            items = items[:MAX_RENDER]
+        self.visible_items = items
+        self.hint.set_text(HINT_DEFAULT)
+
+        if not items:
+            row = Gtk.ListBoxRow()
+            row.set_selectable(False)
+            row.set_activatable(False)
+            lbl = Gtk.Label()
+            lbl.get_style_context().add_class('empty')
+            lbl.set_text('暂无记录' if not kw else '没有匹配的记录')
+            lbl.set_margin_top(40)
+            lbl.set_margin_bottom(40)
+            row.add(lbl)
+            self.listbox.add(row)
+            row.show_all()
+            return
+
+        for it in items:
+            self.listbox.add(self._make_row(it))
+        self.listbox.show_all()
+        if total > MAX_RENDER:
+            self.hint.set_text('显示前 %d 条（共 %d 条），输入关键词可精确查找'
+                               % (MAX_RENDER, total))
+
+    def _make_row(self, it):
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        box.get_style_context().add_class('item')
+        box.set_spacing(10)
+        kind = it.get('k', 'text')
+
+        if kind == 'image':
+            img = self._thumb_widget(it)
+            box.pack_start(img, False, False, 0)
+            lbl = Gtk.Label()
+            lbl.get_style_context().add_class('item-title')
+            lbl.set_text(it.get('v', '[图片]'))
+            lbl.set_xalign(0.0)
+            lbl.set_hexpand(True)
+            lbl.set_width_chars(1)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            box.pack_start(lbl, True, True, 0)
+        else:
+            lbl = Gtk.Label()
+            lbl.get_style_context().add_class('item-title')
+            lbl.set_text(preview(it.get('v', '')))
+            lbl.set_xalign(0.0)
+            lbl.set_line_wrap(True)
+            lbl.set_line_wrap_mode(Pango.WrapMode.CHAR)
+            lbl.set_lines(2)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            lbl.set_hexpand(True)
+            lbl.set_width_chars(1)   # 不撑开父容器，交由 ellipsize 截断
+            box.pack_start(lbl, True, True, 0)
+
+            if kind == 'html':
+                badge = Gtk.Label()
+                badge.get_style_context().add_class('badge')
+                badge.set_text('富文本')
+                badge.set_valign(Gtk.Align.START)
+                badge.set_tooltip_text('含格式，粘贴时保留样式')
+                box.pack_start(badge, False, False, 0)
+
+        t = Gtk.Label()
+        t.get_style_context().add_class('item-time')
+        t.set_text(human_time(it.get('ts', time.time())))
+        t.set_valign(Gtk.Align.START)
+        t.set_xalign(1.0)
+        t.set_width_chars(7)
+        t.set_max_width_chars(7)
+        box.pack_start(t, False, False, 0)
+
+        row.add(box)
+        row.item_data = it
+        row.show_all()      # 显式递归显示：ListBox 内嵌 Gtk.Image 有时不随父级 show
+        return row
+
+    def _thumb_widget(self, it):
+        """列表缩略图。
+
+        默认不画——本环境下 GDK 通过 MIT-SHM 上传位图会报 BadValue 并崩进程
+        （Gtk.Image 渲染不出来，Gdk.cairo_set_source_pixbuf 直接段错误，
+        DrawingArea 跑两三分钟后 ShmPutImage 崩）。只有在设置里手动打开
+        缩略图，才走 cairo ImageSurface 这条路。
+        """
+        ph = Gtk.Label(label='[图]')
+        ph.get_style_context().add_class('item-time')
+        ph.set_size_request(40, THUMB_H)
+
+        if not get_show_thumbs():
+            return ph
+
+        rel = it.get('t') or it.get('p') or ''
+        path = os.path.join(DATA_DIR, rel) if rel else ''
+        surf = None
+        if path and os.path.exists(path):
+            try:
+                surf = cairo.ImageSurface.create_from_png(path)
+            except Exception:
+                surf = None
+        if surf is None:
+            return ph
+
+        da = Gtk.DrawingArea()
+        da.set_size_request(surf.get_width(), surf.get_height())
+        da.set_valign(Gtk.Align.CENTER)
+
+        def _draw(_w, cr, s=surf):
+            cr.set_source_surface(s, 0, 0)
+            cr.paint()
+            return False
+
+        da.connect('draw', _draw)
+        return da
+
+    def _on_search(self, entry):
+        self._rebuild()
+        rows = self.listbox.get_children()
+        if rows and rows[0].get_selectable():
+            self.listbox.select_row(rows[0])
+
+    # ---------------- 键盘 ----------------
+
+    def _move_selection(self, delta):
+        rows = [r for r in self.listbox.get_children() if r.get_selectable()]
+        if not rows:
+            return
+        cur = self.listbox.get_selected_row()
+        idx = rows.index(cur) if cur in rows else -1
+        idx = max(0, min(len(rows) - 1, idx + delta))
+        self.listbox.select_row(rows[idx])
+        self._scroll_to(rows[idx])
+
+    def _scroll_to(self, row):
+        try:
+            adj = self.scroll.get_vadjustment()
+            alloc = row.get_allocation()
+            top = adj.get_value()
+            bottom = top + adj.get_page_size()
+            if alloc.y < top:
+                adj.set_value(alloc.y)
+            elif alloc.y + alloc.height > bottom:
+                adj.set_value(alloc.y + alloc.height - adj.get_page_size())
+        except Exception:
+            pass
+
+    def _on_entry_key(self, widget, event):
+        k = event.keyval
+        if k == Gdk.KEY_Down:
+            self._move_selection(1)
+            return True
+        if k == Gdk.KEY_Up:
+            self._move_selection(-1)
+            return True
+        if k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._activate_selected()
+            return True
+        if k == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        if k in (Gdk.KEY_Delete, Gdk.KEY_BackSpace) and \
+                (event.state & Gdk.ModifierType.CONTROL_MASK) and k == Gdk.KEY_Delete:
+            self._delete_selected()
+            return True
+        return False
+
+    def _on_window_key(self, widget, event):
+        k = event.keyval
+        if k == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        if k == Gdk.KEY_Down:
+            self._move_selection(1)
+            return True
+        if k == Gdk.KEY_Up:
+            self._move_selection(-1)
+            return True
+        return False
+
+    # ---------------- 动作 ----------------
+
+    def _delete_selected(self):
+        row = self.listbox.get_selected_row()
+        if not row or not hasattr(row, 'item_data'):
+            return
+        target = row.item_data
+        for i, it in enumerate(self.store.items):
+            if it is target:
+                self.store.remove(i)
+                break
+        self._rebuild()
+
+    def _on_row_activated(self, lb, row):
+        if hasattr(row, 'item_data'):
+            self._paste(row.item_data)
+
+    def _activate_selected(self):
+        row = self.listbox.get_selected_row()
+        if row and hasattr(row, 'item_data'):
+            self._paste(row.item_data)
+
+    def _paste(self, item):
+        if not item:
+            return
+        prev = self.prev_window
+        self.hide()
+        self.app.set_clipboard(item)
+        GLib.timeout_add(180, self._send_keys, prev)
+
+    def _send_keys(self, prev):
+        cmds = []
+        if prev:
+            cmds.append('xdotool windowactivate --sync %s' % prev)
+        cmds.append('xdotool key --clearmodifiers ctrl+v')
+        try:
+            subprocess.Popen(['/bin/sh', '-c',
+                              ' ; '.join(cmds)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        return False
+
+
+class SettingsDialog(object):
+    """设置面板：字号 / 背景透明度 / 历史条目上限。
+
+    刻意不用 Gtk.Scale / SpinButton / CheckButton / Button —— 它们的滑块、
+    箭头、勾选框在 UKUI 主题下走位图资源，而本环境的位图上传（MIT-SHM
+    ShmPutImage）是坏的，窗口一显示就崩进程（已用最小用例复现）。
+    这里只用 Label / Entry / EventBox / Box 这些纯矢量控件。
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.win = None
+        self._rounded = False       # 设置窗口不用 ARGB，边框交给 CSS 画
+        self._build()
+
+    def _build(self):
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_keep_above(True)
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        win.set_position(Gtk.WindowPosition.CENTER)
+        win.set_default_size(420, 330)
+        win.get_style_context().add_class('clipwin')
+        win.connect('delete-event', lambda w, e: (w.hide(), True)[1])
+        win.connect('key-press-event', self._on_key)
+
+        # 窗口本身是矩形，CSS 圆角只在内部面板上生效，四角会露出窗口底色。
+        # 把底色设成与边框同色，圆角看起来就连贯了。
+        try:
+            win.override_background_color(
+                Gtk.StateFlags.NORMAL,
+                Gdk.RGBA(0x9a / 255.0, 0xa3 / 255.0, 0xad / 255.0, 1.0))
+        except Exception:
+            pass
+
+        eb = Gtk.EventBox()
+        eb.get_style_context().add_class(
+            'panel-trans' if self._rounded else 'panel')
+        eb.override_background_color(Gtk.StateFlags.NORMAL,
+                                     Gdk.RGBA(1, 1, 1, 1))
+        win.add(eb)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_margin_top(16)
+        box.set_margin_bottom(14)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+        box.set_spacing(9)
+        eb.add(box)
+
+        title = Gtk.Label(label='设置')
+        title.get_style_context().add_class('settings-title')
+        title.set_xalign(0.0)
+        box.pack_start(title, False, False, 0)
+
+        self.font_entry, row = self._num_row(
+            '文字大小（8–20 pt）', '%.1f' % get_font_size(), 6)
+        box.pack_start(row, False, False, 0)
+
+        self.op_entry, row = self._num_row(
+            '背景透明度（50–100%）', '%.0f' % (get_opacity() * 100), 6)
+        box.pack_start(row, False, False, 0)
+
+        self.cnt_entry, row = self._num_row(
+            '历史条目上限（50–5000）', '%d' % get_max_items(), 8)
+        box.pack_start(row, False, False, 0)
+
+        tip = Gtk.Label(label='改完按回车立即生效')
+        tip.get_style_context().add_class('settings-value')
+        tip.set_xalign(0.0)
+        tip.set_margin_top(2)
+        box.pack_start(tip, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        btns.set_spacing(12)
+        btns.set_margin_top(10)
+        btns.pack_start(self._text_button('恢复默认', self._reset), False, False, 0)
+        btns.pack_end(self._text_button('完成', lambda: self.hide()), False, False, 0)
+        box.pack_end(btns, False, False, 0)
+
+        self.win = win
+
+    def _num_row(self, label, value, width):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_spacing(10)
+        lbl = Gtk.Label(label=label)
+        lbl.get_style_context().add_class('settings-label')
+        lbl.set_xalign(0.0)
+        row.pack_start(lbl, True, True, 0)
+        entry = Gtk.Entry()
+        entry.set_text(value)
+        entry.set_width_chars(width)
+        entry.set_max_width_chars(width)
+        entry.set_alignment(1.0)
+        entry.connect('activate', self._commit)
+        row.pack_end(entry, False, False, 0)
+        return entry, row
+
+    def _text_button(self, text, cb):
+        eb = Gtk.EventBox()
+        lbl = Gtk.Label(label=text)
+        lbl.get_style_context().add_class('btn')
+        eb.add(lbl)
+        eb.connect('button-release-event', lambda w, e: (cb(), True)[1])
+        return eb
+
+    def _commit(self, *_):
+        try:
+            fs = float(self.font_entry.get_text().strip())
+        except Exception:
+            fs = get_font_size()
+        try:
+            op = float(self.op_entry.get_text().strip().rstrip('%'))
+        except Exception:
+            op = get_opacity() * 100
+        try:
+            cnt = int(float(self.cnt_entry.get_text().strip()))
+        except Exception:
+            cnt = get_max_items()
+
+        fs = max(FONT_MIN, min(FONT_MAX, fs))
+        op = max(50.0, min(100.0, op))
+        cnt = max(50, min(5000, cnt))
+
+        cfg = load_config()
+        cfg['font_size'] = round(fs, 1)
+        cfg['opacity'] = round(op / 100.0, 2)
+        cfg['max_items'] = cnt
+        save_config(cfg)
+        self.apply()
+        self._refill()
+        return False
+
+    def apply(self):
+        panel = self.app.panel
+        panel._install_css()
+        panel.store.load()
+        panel._rebuild()
+        if panel._rounded:
+            panel.win.queue_draw()
+        else:
+            panel.win.set_opacity(get_opacity())
+
+    def _reset(self):
+        self.font_entry.set_text('%.1f' % DEFAULT_FONT)
+        self.op_entry.set_text('100')
+        self.cnt_entry.set_text(str(MAX_ITEMS))
+        self._commit()
+
+    def _refill(self):
+        self.font_entry.set_text('%.1f' % get_font_size())
+        self.op_entry.set_text('%.0f' % (get_opacity() * 100))
+        self.cnt_entry.set_text('%d' % get_max_items())
+
+    def _on_key(self, w, e):
+        if e.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        return False
+
+    def show(self):
+        self._refill()
+        self.win.show_all()
+        self.win.present()
+
+    def hide(self):
+        self.win.hide()
+
+
+# --------------------------------------------------------------------------
+# 应用主体（常驻）
+# --------------------------------------------------------------------------
+
+class ClipHist(object):
+    def __init__(self):
+        self.store = Store(HISTORY_FILE)
+        self._writing = False
+        self.settings = None
+        self.panel = ClipPanel(self)
+        self.settings = SettingsDialog(self)
+
+        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.clipboard.connect('owner-change', self._on_owner_change)
+
+        self.hotkey = HotkeyMonitor(self.panel.toggle)
+        self.hotkey.start()
+
+        self._start_ipc()
+
+    # ---- 剪贴板监听 ----
+
+    def _on_owner_change(self, cb, event):
+        if self._writing:
+            return
+        GLib.timeout_add(60, self._capture)
+
+    def _capture(self):
+        if self._writing:
+            return False
+        try:
+            ok, targets = self.clipboard.wait_for_targets()
+        except Exception:
+            ok, targets = False, None
+        if not ok or not targets:
+            return False
+        names = set(a.name() for a in targets)
+
+        # 1) 图片优先（网页/截图/图片编辑器）
+        if names & IMAGE_TARGETS:
+            try:
+                pb = self.clipboard.wait_for_image()
+            except Exception:
+                pb = None
+            # 某些应用（文件管理器）会附带一个 1×1 占位图，尺寸过小直接忽略
+            if pb is not None and pb.get_width() > 2 and pb.get_height() > 2:
+                self._push_image(pb)
+                return False
+
+        # 2) 富文本：同时保留 HTML 和纯文本回退
+        if 'text/html' in names:
+            try:
+                data = self.clipboard.wait_for_contents(
+                    Gdk.Atom.intern('text/html', False))
+            except Exception:
+                data = None
+            if data is not None:
+                raw = data.get_data()
+                if raw:
+                    doc = raw.decode('utf-8', 'ignore')
+                    if doc.strip():
+                        plain = ''
+                        try:
+                            plain = self.clipboard.wait_for_text() or ''
+                        except Exception:
+                            pass
+                        self.store.push_item({
+                            'k': 'html',
+                            'v': plain or strip_html(doc),
+                            'h': doc})
+                        return False
+
+        # 3) 纯文本
+        try:
+            text = self.clipboard.wait_for_text()
+        except Exception:
+            text = None
+        if text:
+            self.store.push(text)
+        return False
+
+    def _push_image(self, pb):
+        """图片落盘（按内容 md5 命名，天然去重）+ 生成缩略图。"""
+        try:
+            ok, buf = pb.save_to_bufferv('png', [], [])
+        except Exception:
+            return
+        if not ok or not buf:
+            return
+        name = 'img_%s.png' % hashlib.md5(buf).hexdigest()[:16]
+        os.makedirs(IMG_DIR, exist_ok=True)
+        path = os.path.join(IMG_DIR, name)
+        if not os.path.exists(path):
+            try:
+                with open(path, 'wb') as f:
+                    f.write(buf)
+            except Exception:
+                return
+
+        thumb = 'th_' + name
+        tpath = os.path.join(IMG_DIR, thumb)
+        if not os.path.exists(tpath):
+            try:
+                w, h = pb.get_width(), pb.get_height()
+                scale = float(THUMB_H) / max(1, h)
+                tw, th = max(1, int(w * scale)), THUMB_H
+                if tw > 260:
+                    scale = 260.0 / w
+                    tw, th = 260, max(1, int(h * scale))
+                small = pb.scale_simple(tw, th, GdkPixbuf.InterpType.BILINEAR)
+                if small is None or not small.savev(tpath, 'png', [], []):
+                    thumb = name
+            except Exception:
+                thumb = name
+
+        self.store.push_item({
+            'k': 'image',
+            'v': '[图片 %d×%d]' % (pb.get_width(), pb.get_height()),
+            'p': 'images/' + name,
+            't': 'images/' + thumb,
+            'w': pb.get_width(),
+            'h': pb.get_height()})
+
+    def set_clipboard(self, item):
+        """把条目内容写回剪贴板（文本 / HTML / 图片三种走不同通道）。"""
+        if not isinstance(item, dict):
+            item = {'k': 'text', 'v': item or ''}
+        self._writing = True
+        kind = item.get('k', 'text')
+        try:
+            if kind == 'image':
+                path = os.path.join(DATA_DIR, item.get('p', ''))
+                pb = GdkPixbuf.Pixbuf.new_from_file(path)
+                self.clipboard.set_image(pb)
+            elif kind == 'html' and item.get('h'):
+                self._set_html(item['h'], item.get('v', ''))
+            else:
+                self.clipboard.set_text(item.get('v', ''), -1)
+        except Exception:
+            pass
+        self.store.touch(item)
+        GLib.timeout_add(600, self._clear_writing)
+        return False
+
+    def _set_html(self, doc, plain):
+        """同时提供 text/html 与纯文本，让目标应用自行择优。
+
+        注意：PyGObject 3.36 没有绑定 gtk_clipboard_set_with_data，
+        所以这里带降级——拿不到多格式接口时只写纯文本，内容不丢、格式会丢。
+        """
+        entries = [
+            Gtk.TargetEntry.new('text/html', 0, 0),
+            Gtk.TargetEntry.new('UTF8_STRING', 0, 1),
+            Gtk.TargetEntry.new('text/plain;charset=utf-8', 0, 1),
+            Gtk.TargetEntry.new('text/plain', 0, 1),
+        ]
+
+        def _get(_cb, selection, info, _data):
+            if info == 0:
+                selection.set(Gdk.Atom.intern('text/html', False), 8,
+                              doc.encode('utf-8'))
+            else:
+                selection.set_text(plain, -1)
+
+        def _clear(_cb, _data):
+            pass
+
+        try:
+            self.clipboard.set_with_data(entries, _get, _clear, None)
+        except (AttributeError, TypeError):
+            self.clipboard.set_text(plain or strip_html(doc), -1)
+
+    def _clear_writing(self):
+        self._writing = False
+        return False
+
+    def open_settings(self):
+        if self.panel.is_visible():
+            self.panel.hide()
+        if self.settings is not None:
+            self.settings.show()
+        return False
+
+    # ---- IPC ----
+
+    def _start_ipc(self):
+        os.makedirs(os.path.dirname(SOCK_FILE), exist_ok=True)
+        try:
+            if os.path.exists(SOCK_FILE):
+                os.unlink(SOCK_FILE)
+        except Exception:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCK_FILE)
+        try:
+            os.chmod(SOCK_FILE, 0o666)
+        except Exception:
+            pass
+        srv.listen(5)
+        self.srv = srv
+
+        def loop():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except Exception:
+                    return
+                try:
+                    data = conn.recv(64).decode('utf-8', 'ignore').strip()
+                    if data == 'show':
+                        GLib.idle_add(self.panel.show)
+                    elif data == 'toggle':
+                        GLib.idle_add(self.panel.toggle)
+                    elif data == 'quit':
+                        GLib.idle_add(Gtk.main_quit)
+                    elif data == 'clear':
+                        self.store.clear()
+                    elif data == 'reload':
+                        GLib.idle_add(self.panel.reload_css)
+                    elif data == 'settings':
+                        GLib.idle_add(self.open_settings)
+                    elif data == 'ping':
+                        pass
+                except Exception:
+                    pass
+                finally:
+                    conn.close()
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def run(self):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, Gtk.main_quit)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, Gtk.main_quit)
+        Gtk.main()
+        try:
+            os.unlink(SOCK_FILE)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# 命令行
+# --------------------------------------------------------------------------
+
+def _send(cmd, timeout=2.0):
+    """向已运行的 daemon 发送命令，成功返回 True。"""
+    if not os.path.exists(SOCK_FILE):
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK_FILE)
+        s.sendall(cmd.encode())
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def _spawn_daemon():
+    # 清掉可能残留在旧 socket（上次异常退出），否则会误判为已启动
+    try:
+        if os.path.exists(SOCK_FILE):
+            os.unlink(SOCK_FILE)
+    except Exception:
+        pass
+
+    exe = os.path.abspath(__file__)
+    subprocess.Popen([exe, 'daemon'],
+                     stdout=subprocess.DEVNULL,
+                     stderr=open('/tmp/cliphist.err', 'ab'),
+                     start_new_session=True)
+    for _ in range(40):
+        time.sleep(0.1)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            s.connect(SOCK_FILE)
+            s.close()
+            return True
+        except Exception:
+            s.close()
+    return False
+
+
+def kill_stale_clients():
+    """兜底清理：把还挂着 cliphist 窗口的 X 客户端从服务端强制断开。
+
+    有些残留实例可能处在别的 PID namespace 里（pkill 够不着），
+    但它们一定在 X 服务器上注册了窗口，用 XKillClient 断连最彻底。
+    返回断开的数量。
+    """
+    try:
+        out = subprocess.check_output(
+            ['xwininfo', '-root', '-tree'],
+            stderr=subprocess.DEVNULL).decode('utf-8', 'ignore')
+    except Exception:
+        return 0
+
+    wids = re.findall(r'(0x[0-9a-f]+)\s+"cliphist"', out)
+    if not wids:
+        return 0
+
+    try:
+        x11 = ctypes.CDLL('libX11.so.6')
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XKillClient.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return 0
+        for w in wids:
+            try:
+                x11.XKillClient(dpy, int(w, 16))
+            except Exception:
+                pass
+        x11.XSync(dpy, 0)
+        return len(wids)
+    except Exception:
+        return 0
+
+
+def _has_stale_windows():
+    """是否还有挂着 cliphist 窗口的残留客户端。"""
+    try:
+        out = subprocess.check_output(
+            ['xwininfo', '-root', '-tree'],
+            stderr=subprocess.DEVNULL).decode('utf-8', 'ignore')
+        return bool(re.search(r'"cliphist"', out))
+    except Exception:
+        return False
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'show'
+
+    if cmd == 'daemon':
+        # 强制接管：先请旧实例退出，然后最多等 3 秒让它的窗口自然销毁。
+        # 这里**不能**用 XKillClient —— 残留窗口的 resource id 会被新连接复用，
+        # 强杀会把自己刚建立的连接一起断掉（Fatal IO error）。
+        # 真要清理顽固残留交给 `cliphist stop`（那个进程没有窗口，安全）。
+        if _send('ping'):
+            _send('quit')
+            for _ in range(50):
+                time.sleep(0.1)
+                if not _send('ping'):
+                    break
+        for _ in range(30):
+            if not _has_stale_windows():
+                break
+            time.sleep(0.1)
+        ClipHist().run()
+
+    elif cmd in ('show', 'toggle', 'settings'):
+        if not _send(cmd):
+            if _spawn_daemon():
+                time.sleep(0.15)
+                _send(cmd)
+            else:
+                print('守护进程启动失败，日志见 /tmp/cliphist.err', file=sys.stderr)
+                return 1
+
+    elif cmd == 'stop':
+        was = _send('quit')
+        time.sleep(0.6)
+        n = kill_stale_clients()
+        if was or n:
+            print('已停止' + ('（另清理残留实例 %d 个）' % n if n else ''))
+        else:
+            print('未在运行')
+
+    elif cmd == 'status':
+        if _send('ping'):
+            n = len(Store(HISTORY_FILE).items)
+            print('运行中，已记录 %d 条，字号 %.1f pt' % (n, get_font_size()))
+        else:
+            print('未运行')
+
+    elif cmd == 'font':
+        if len(sys.argv) > 2:
+            try:
+                v = float(sys.argv[2])
+            except ValueError:
+                print('用法: cliphist font <%.0f-%.0f>' % (FONT_MIN, FONT_MAX))
+                return 1
+            v = max(FONT_MIN, min(FONT_MAX, v))
+            c = load_config()
+            c['font_size'] = v
+            save_config(c)
+            ok = _send('reload')
+            print('字号已设为 %.1f pt%s'
+                  % (v, '' if ok else '（守护进程未运行，下次启动生效）'))
+        else:
+            print('当前字号 %.1f pt，范围 %.0f-%.0f'
+                  % (get_font_size(), FONT_MIN, FONT_MAX))
+
+    elif cmd == 'clear':
+        s = Store(HISTORY_FILE)
+        s.clear()
+        _send('clear')
+        print('历史已清空')
+
+    else:
+        print(__doc__)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
