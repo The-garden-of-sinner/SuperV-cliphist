@@ -1,0 +1,6 @@
+libXext.so.6 {
+  global:
+    XShmQueryExtension;
+  local:
+    *;
+};

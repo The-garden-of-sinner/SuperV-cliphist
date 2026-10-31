@@ -20,6 +20,7 @@ import math
 import time
 import fcntl
 import socket
+import urllib.parse
 import ctypes
 import hashlib
 import signal
@@ -486,6 +487,27 @@ def strip_html(html):
     except Exception:
         pass
     return re.sub(r'\s+', ' ', t).strip()
+
+
+def uris_to_paths(blob):
+    """把 text/uri-list 解析成可读的路径列表。
+
+    文件管理器复制文件时给的是这种格式（每行一个 URI，# 开头是注释）。
+    直接当纯文本存下来的话，历史里就是一串 file%3A//... 的编码串，
+    既不好认也不好用；这里还原成人能读、能直接粘进终端的路径。
+    """
+    out = []
+    for line in (blob or '').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('file://'):
+            p = urllib.parse.unquote(line[7:])
+            if p:
+                out.append(p)
+        else:
+            out.append(line)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1097,6 +1119,14 @@ class ClipPanel(object):
                 badge.set_valign(Gtk.Align.START)
                 badge.set_tooltip_text('含格式，粘贴时保留样式')
                 box.pack_start(badge, False, False, 0)
+            elif kind == 'file':
+                badge = Gtk.Label()
+                badge.get_style_context().add_class('badge')
+                n = it.get('v', '').count('\n') + 1
+                badge.set_text('文件' if n == 1 else '文件 ×%d' % n)
+                badge.set_valign(Gtk.Align.START)
+                badge.set_tooltip_text('粘贴时写入文件路径')
+                box.pack_start(badge, False, False, 0)
 
         t = Gtk.Label()
         t.get_style_context().add_class('item-time')
@@ -1572,6 +1602,23 @@ class ClipHist(object):
             return False
         names = set(a.name() for a in targets)
 
+        # 0) 文件复制：优先按路径记录。
+        # 文件管理器复制文件时会同时提供 text/uri-list，图片文件还常附带
+        # 一个缩略图；如果先走图片分支，存下来的就成了缩略图，路径反而丢了。
+        if 'text/uri-list' in names:
+            try:
+                data = self.clipboard.wait_for_contents(
+                    Gdk.Atom.intern('text/uri-list', False))
+            except Exception:
+                data = None
+            if data is not None:
+                raw = data.get_data()
+                paths = uris_to_paths(raw.decode('utf-8', 'ignore')
+                                      if raw else '')
+                if paths:
+                    self._accept({'k': 'file', 'v': '\n'.join(paths)})
+                    return False
+
         # 1) 图片优先（网页/截图/图片编辑器）
         if names & IMAGE_TARGETS:
             try:
@@ -1897,10 +1944,77 @@ def _has_stale_windows():
         return False
 
 
+def _supervise():
+    """父进程守着界面子进程：子进程异常退出就重启。
+
+    本机 GTK 给所有顶层窗口分配的都是 32 位 ARGB 视觉（连普通窗口也是这样），
+    每次重绘都要经 MIT-SHM 把位图上传给 X；而这条通道在这台机器上会间歇性
+    报 BadValue 并直接把进程打掉（request_code 130 / minor_code 3）。
+    这是环境缺陷，应用层无法绕开，但可以让它自动回来——
+    否则按 Win+V 没反应，且用户不知道要去重启。
+    """
+    restarts = 0
+    while True:
+        pid = os.fork()
+        if pid == 0:
+            # 子进程：只跑界面与剪贴板，不碰锁（锁由父进程持有）
+            code = 0
+            try:
+                ClipHist().run()
+            except BaseException:
+                code = 1
+            os._exit(code)
+
+        try:
+            _, status = os.waitpid(pid, 0)
+        except OSError:
+            return 1
+
+        if os.WIFEXITED(status):
+            return os.WEXITSTATUS(status)   # 正常退出（quit / stop），父进程跟着退
+
+        sig = os.WTERMSIG(status)
+        restarts += 1
+        sys.stderr.write('[cliphist] 界面进程异常退出（signal %d），第 %d 次重启\n'
+                         % (sig, restarts))
+        sys.stderr.flush()
+        if restarts > 30:
+            sys.stderr.write('[cliphist] 连续崩溃过多，停止重启；'
+                             '可执行 cliphist daemon 手动再启动\n')
+            sys.stderr.flush()
+            return 1
+        time.sleep(min(1.0 * restarts, 5.0))
+
+
+def _maybe_reexec_noshm():
+    """若本机存在禁用 MIT-SHM 的预载库，则带它重新执行自己。
+
+    这台机器上 GDK 给所有顶层窗口分配的视觉都是 32 位，每次重绘都要经
+    MIT-SHM 上传位图，而该通道会间歇性报 BadValue 把进程打掉。
+    装上 noshm.so 后 XShmQueryExtension 返回 0，GDK 自动退回 XPutImage。
+    库文件不存在就什么也不做，正常环境完全不受影响。
+    """
+    if os.environ.get('CLIPHIST_NOSHM') == '1':
+        return
+    shim = os.path.join(HOME, '.local', 'lib', 'cliphist', 'noshm.so')
+    if not os.path.isfile(shim):
+        return
+    env = dict(os.environ)
+    env['LD_PRELOAD'] = (shim + ' ' + env.get('LD_PRELOAD', '')).strip()
+    env['CLIPHIST_NOSHM'] = '1'
+    try:
+        os.execve(sys.executable,
+                  [sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                  env)
+    except Exception:
+        pass
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'show'
 
     if cmd == 'daemon':
+        _maybe_reexec_noshm()
         # 单实例靠文件锁保证：拿不到锁说明已有实例活着，直接退出。
         # 比"先删 socket 再抢"可靠——删 socket 会把正在服务的实例踢成孤儿。
         lock = _try_lock()
@@ -1922,8 +2036,7 @@ def main():
             if not _has_stale_windows():
                 break
             time.sleep(0.1)
-        ClipHist().run()
-        return 0
+        return _supervise()
 
     elif cmd in ('show', 'toggle', 'settings'):
         if not _send(cmd):
