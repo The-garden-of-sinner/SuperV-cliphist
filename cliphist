@@ -51,11 +51,18 @@ LOCK_FILE = os.path.join(_RUNTIME_DIR, 'clip-hist.lock')
 
 
 def _try_lock():
-    """拿单实例锁。成功返回文件对象（调用方需一直持有到进程退出），失败返回 None。"""
+    """拿单实例锁。成功返回文件对象（调用方需一直持有到进程退出），失败返回 None。
+
+    以 O_RDWR 打开而不是 'w'：'w' 会在拿锁之前就把文件截断，
+    等于把正在运行实例写进去的 PID 清掉；截断必须发生在拿到锁之后。
+    """
     f = None
     try:
-        f = open(LOCK_FILE, 'w')
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        f = os.fdopen(fd, 'r+')
         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.seek(0)
+        f.truncate()
         f.write(str(os.getpid()))
         f.flush()
         return f
@@ -209,6 +216,8 @@ class Store(object):
     def __init__(self, path):
         self.path = path
         self.items = []
+        # 隔离失败时置 True：宁可本次不写盘，也不能用空列表覆盖掉原文件
+        self.readonly = False
         self.load()
 
     def load(self):
@@ -217,28 +226,63 @@ class Store(object):
                 data = json.load(f)
             if not isinstance(data, list):
                 raise ValueError('root is not a list')
-            self.items = [x for x in data
-                          if isinstance(x, dict) and ('v' in x or 'h' in x)]
         except FileNotFoundError:
             self.items = []          # 首次运行，正常情况
-        except Exception as e:
-            # 文件存在但解析失败：绝不能把内存置空后照常 save，
-            # 否则下次 push 会把损坏内容和旧历史一起覆盖掉。
-            # 先改名留档，再从空列表开始。
+            return
+        except (ValueError, UnicodeDecodeError) as e:
+            # 内容本身坏了（JSON 语法错 / 编码错 / 根不是数组）：
+            # 改名留档，绝不用空列表把原文件覆盖掉。
             self.items = []
-            self._quarantine(e)
+            if not self._quarantine(e):
+                self.readonly = True
+            return
+        except OSError as e:
+            # 权限不足、文件被占用、路径是目录等：这是 I/O 问题，不是数据损坏。
+            # 此时绝不能把文件挪走，也不能清空内存（否则下一次 save 就覆盖了）。
+            self.readonly = True
+            sys.stderr.write('[cliphist] 历史文件读取失败（%s），本次以只读方式运行\n'
+                             % e)
+            sys.stderr.flush()
+            return
+        except Exception as e:
+            self.readonly = True
+            sys.stderr.write('[cliphist] 历史文件读取异常（%s），本次以只读方式运行\n'
+                             % e)
+            sys.stderr.flush()
+            return
+
+        self.items = [x for x in data
+                      if isinstance(x, dict) and ('v' in x or 'h' in x)]
+        self.readonly = False        # 读取恢复正常后解除只读
 
     def _quarantine(self, err):
+        """把损坏的历史改名留档。返回是否成功。文件名保证唯一，不覆盖旧备份。"""
         try:
-            bak = '%s.corrupt-%d' % (self.path, int(time.time()))
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            bak = '%s.corrupt-%s' % (self.path, stamp)
+            n = 1
+            # 同一秒内连续损坏时不能覆盖上一份备份
+            while os.path.exists(bak):
+                bak = '%s.corrupt-%s-%d' % (self.path, stamp, n)
+                n += 1
             os.replace(self.path, bak)
             sys.stderr.write('[cliphist] 历史文件无法解析（%s），已另存为 %s\n'
                              % (err, bak))
             sys.stderr.flush()
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            sys.stderr.write('[cliphist] 历史文件损坏且无法另存（%s），'
+                             '为避免覆盖已停止写入，请手工处理 %s\n'
+                             % (e, self.path))
+            sys.stderr.flush()
+            return False
 
     def save(self):
+        """写盘。返回是否成功——调用方据此决定要不要清理图片、要不要回滚内存。"""
+        if self.readonly:
+            sys.stderr.write('[cliphist] 处于只读状态（历史文件此前读取失败），跳过保存\n')
+            sys.stderr.flush()
+            return False
         d = os.path.dirname(self.path)
         try:
             os.makedirs(d, mode=0o700, exist_ok=True)
@@ -251,9 +295,15 @@ class Store(object):
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(self.items, f, ensure_ascii=False)
             os.replace(tmp, self.path)
+            return True
         except Exception as e:
             sys.stderr.write('[cliphist] 历史保存失败：%s\n' % e)
             sys.stderr.flush()
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            return False
 
     @staticmethod
     def _key(it):
@@ -287,8 +337,11 @@ class Store(object):
                 return True
 
         self.items.insert(0, item)
-        self._trim()
-        self.save()
+        dropped = self._trim()
+        if self.save():
+            for it in dropped:
+                self._purge_files(it)    # 落盘成功后才删图片，避免 JSON 指向已删文件
+        # 保存失败时条目仍留在内存里，等下一次写入机会再落盘
         return True
 
     def touch(self, item):
@@ -303,9 +356,17 @@ class Store(object):
                 return
 
     def _trim(self):
+        """按上限裁剪内存，返回被裁掉的条目。
+
+        这里只改内存、不删图片文件：图片要等 save() 成功之后才能删，
+        否则写盘失败时 JSON 里仍引用着已经被删掉的图片。
+        """
         limit = get_max_items()
-        while len(self.items) > limit:
-            self._purge_files(self.items.pop())
+        if len(self.items) <= limit:
+            return []
+        dropped = self.items[limit:]
+        del self.items[limit:]
+        return dropped
 
     def _purge_files(self, item):
         if item.get('k') != 'image':
@@ -324,15 +385,28 @@ class Store(object):
                     pass
 
     def remove(self, index):
-        if 0 <= index < len(self.items):
-            self._purge_files(self.items.pop(index))
-            self.save()
+        if not (0 <= index < len(self.items)):
+            return False
+        snapshot = list(self.items)
+        removed = self.items.pop(index)
+        if not self.save():
+            # 写盘失败就回滚内存：否则界面显示已删、磁盘却还在，
+            # 而且图片文件已经被清掉，下次读到就是坏条目
+            self.items[:] = snapshot
+            return False
+        self._purge_files(removed)
+        return True
 
     def clear(self):
-        for it in self.items:
-            self._purge_files(it)
+        snapshot = list(self.items)
         self.items = []
-        self.save()
+        if not self.save():
+            self.items = snapshot
+            return False
+        # 落盘成功后再清理图片文件
+        for it in snapshot:
+            self._purge_files(it)
+        return True
 
 
 def _fix_perms():
@@ -626,6 +700,7 @@ class ClipPanel(object):
         self.win = None
         self._pos_timer = None
         self._search_timer = None
+        self._notify_timer = None
         self._build()
 
     # ---------------- 构建 ----------------
@@ -1056,6 +1131,17 @@ class ClipPanel(object):
             self.listbox.select_row(rows[0])
         return False
 
+    def _flush_search(self):
+        """把还在防抖窗口里的搜索立刻执行掉。
+
+        否则「输入关键词后马上回车」时，列表还是过滤前的内容，
+        选中的也是过滤前的第一条 —— 会粘出完全不相干的旧记录。
+        """
+        if self._search_timer:
+            GLib.source_remove(self._search_timer)
+            self._search_timer = None
+            self._do_search()
+
     # ---------------- 键盘 ----------------
 
     def _move_selection(self, delta):
@@ -1090,6 +1176,7 @@ class ClipPanel(object):
             self._move_selection(-1)
             return True
         if k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._flush_search()
             self._activate_selected()
             return True
         if k == Gdk.KEY_Escape:
@@ -1100,6 +1187,7 @@ class ClipPanel(object):
             # 想删条目则用 Ctrl+Del。这样和底部「Del 删除」的提示一致。
             if (event.state & Gdk.ModifierType.CONTROL_MASK) \
                     or not self.entry.get_text():
+                self._flush_search()
                 self._delete_selected()
                 return True
         return False
@@ -1119,6 +1207,24 @@ class ClipPanel(object):
 
     # ---------------- 动作 ----------------
 
+    def _notify(self, msg):
+        """在底部提示位临时显示一条消息，2.5 秒后恢复。"""
+        try:
+            if getattr(self, '_notify_timer', None):
+                GLib.source_remove(self._notify_timer)
+            self.hint.set_text(msg)
+            self._notify_timer = GLib.timeout_add(2500, self._restore_hint)
+        except Exception:
+            pass
+
+    def _restore_hint(self):
+        self._notify_timer = None
+        try:
+            self.hint.set_text(HINT_DEFAULT)
+        except Exception:
+            pass
+        return False
+
     def _delete_selected(self):
         row = self.listbox.get_selected_row()
         if not row or not hasattr(row, 'item_data'):
@@ -1127,7 +1233,9 @@ class ClipPanel(object):
         idx = row.get_index()
         for i, it in enumerate(self.store.items):
             if it is target:
-                self.store.remove(i)
+                if not self.store.remove(i):
+                    self._notify('删除失败：历史文件无法写入')
+                    return
                 break
         self._rebuild()
         # 删完把选中落在原位置（或最后一条），方便连续删除
@@ -1155,24 +1263,30 @@ class ClipPanel(object):
         GLib.timeout_add(180, self._send_keys, prev)
 
     def _send_keys(self, prev):
-        # 先激活原窗口并确认成功，失败就不发 Ctrl+V ——
-        # 否则目标窗口已经关了，内容会粘到当前焦点的随便哪个窗口上。
-        if prev:
+        # 没有记录到目标窗口就放弃自动粘贴：此时焦点在哪不可知，
+        # 盲发 Ctrl+V 可能粘到别的窗口里。内容已在剪贴板，手动按即可。
+        if not prev:
+            return False
+
+        def work():
+            # 激活是阻塞调用，放到线程里做，避免卡住 GTK 主线程
             try:
                 r = subprocess.run(
                     ['xdotool', 'windowactivate', '--sync', str(prev)],
                     timeout=1.5, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
                 if r.returncode != 0:
-                    return False
+                    return
             except Exception:
-                return False        # 超时 / xdotool 缺失，都不该盲发按键
-        try:
-            subprocess.Popen(['xdotool', 'key', '--clearmodifiers', 'ctrl+v'],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+                return          # 超时 / xdotool 缺失，都不该盲发按键
+            try:
+                subprocess.Popen(['xdotool', 'key', '--clearmodifiers', 'ctrl+v'],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
         return False
 
 
@@ -1309,8 +1423,10 @@ class SettingsDialog(object):
         cfg['max_items'] = cnt
         save_config(cfg)
         # 上限调小后立即裁掉多余条目，不用等下一次 push
-        self.app.store._trim()
-        self.app.store.save()
+        dropped = self.app.store._trim()
+        if self.app.store.save():
+            for it in dropped:
+                self.app.store._purge_files(it)
         self.apply()
         self._refill()
         return False
@@ -1516,6 +1632,7 @@ class ClipHist(object):
             item = {'k': 'text', 'v': item or ''}
         kind = item.get('k', 'text')
         ok = True
+        wrote_html = False
         try:
             if kind == 'image':
                 path = os.path.join(DATA_DIR, item.get('p', ''))
@@ -1525,7 +1642,7 @@ class ClipHist(object):
                 else:
                     self.clipboard.set_image(pb)
             elif kind == 'html' and item.get('h'):
-                self._set_html(item['h'], item.get('v', ''))
+                wrote_html = self._set_html(item['h'], item.get('v', ''))
             else:
                 self.clipboard.set_text(item.get('v', ''), -1)
         except Exception:
@@ -1533,7 +1650,14 @@ class ClipHist(object):
 
         if ok:
             self.store.touch(item)
-            self._own_hash = self._fingerprint(item)
+            # 指纹必须按「实际写进剪贴板的形式」算。
+            # _set_html 降级成纯文本时，如果仍按 HTML 算指纹，
+            # 随后捕获到的那段纯文本会被当成新内容再入库一次。
+            if kind == 'html' and item.get('h') and not wrote_html:
+                self._own_hash = ('text', item.get('v') or
+                                  strip_html(item['h']))
+            else:
+                self._own_hash = self._fingerprint(item)
             if self._own_timer:
                 GLib.source_remove(self._own_timer)
             self._own_timer = GLib.timeout_add(2500, self._clear_own_hash)
@@ -1541,6 +1665,9 @@ class ClipHist(object):
 
     def _set_html(self, doc, plain):
         """同时提供 text/html 与纯文本，让目标应用自行择优。
+
+        返回 True 表示确实写入了 text/html；False 表示走了纯文本降级
+        （调用方需要据此调整自身写入的指纹）。
 
         注意：PyGObject 3.36 没有绑定 gtk_clipboard_set_with_data，
         所以这里带降级——拿不到多格式接口时只写纯文本，内容不丢、格式会丢。
@@ -1564,14 +1691,18 @@ class ClipHist(object):
 
         try:
             self.clipboard.set_with_data(entries, _get, _clear, None)
+            return True
         except (AttributeError, TypeError):
             self.clipboard.set_text(plain or strip_html(doc), -1)
+            return False
 
     def _on_ipc_clear(self):
         """IPC 来的清空请求：必须回主线程执行，否则与 GTK 线程的 push 撞车。"""
-        self.store.clear()
-        if self.panel.is_visible():
-            self.panel._rebuild()
+        if self.store.clear():
+            if self.panel.is_visible():
+                self.panel._rebuild()
+        else:
+            self.panel._notify('清空失败：历史文件无法写入')
         return False
 
     def open_settings(self):
@@ -1658,17 +1789,12 @@ def _send(cmd, timeout=2.0):
 
 
 def _spawn_daemon():
-    # 先确认真的没在跑：socket 文件存在不代表服务活着，
-    # 而删掉别人正在用的 socket 会让那个实例变成连不上的孤儿。
+    # 只做两件事：判断要不要启动、启动后等 socket 就绪。
+    # **不删 socket** —— 探活失败可能只是对端暂时繁忙，
+    # 删掉活动 socket 会让正在服务的实例变成连不上的孤儿。
+    # 残留 socket 由守护进程在拿到 flock 之后自行清理（那时才确定没人用）。
     if _socket_alive():
         return True
-
-    # 清理上次异常退出留下的死 socket
-    try:
-        if os.path.exists(SOCK_FILE):
-            os.unlink(SOCK_FILE)
-    except Exception:
-        pass
 
     exe = os.path.abspath(__file__)
     subprocess.Popen([exe, 'daemon'],
@@ -1812,7 +1938,9 @@ def main():
         # 守护进程在跑时必须交给它清空。否则它内存里仍是旧数据，
         # 下一次 push 会把整个文件覆盖回去（表现为「清空后记录又复活」）。
         if not _send('clear'):
-            Store(HISTORY_FILE).clear()
+            if not Store(HISTORY_FILE).clear():
+                print('清空失败：历史文件无法写入', file=sys.stderr)
+                return 1
         print('历史已清空')
 
     else:
