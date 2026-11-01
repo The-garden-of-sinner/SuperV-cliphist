@@ -623,7 +623,12 @@ class SqliteStore(object):
         self._maybe_snapshot()
 
     def _quarantine_db(self, reason):
-        """把损坏的库与 WAL 文件改名留档，绝不直接删。"""
+        """把损坏的库连同 WAL 一起改名留档，绝不直接删。
+
+        WAL 里可能还有尚未 checkpoint 的已提交事务，删掉就等于丢数据；
+        但也不能留在原路径——新库建起来后 SQLite 会尝试套用旧 WAL。
+        所以整体搬到备份名旁边，供 `sqlite3 .recover` 之类的工具抢救。
+        """
         try:
             if self.conn is not None:
                 self.conn.close()
@@ -631,11 +636,14 @@ class SqliteStore(object):
             pass
         bak = _unique_backup(self.path, 'corrupt')
         for suffix in ('-wal', '-shm'):
+            src = self.path + suffix
+            if not os.path.exists(src):
+                continue
             try:
-                os.unlink(self.path + suffix)
+                os.replace(src, bak + suffix)
             except Exception:
                 pass
-        sys.stderr.write('[cliphist] 历史库损坏（%s），已另存为 %s\n'
+        sys.stderr.write('[cliphist] 历史库损坏（%s），已另存为 %s（含 WAL）\n'
                          % (reason, bak))
         sys.stderr.flush()
         return bak
@@ -764,12 +772,16 @@ class SqliteStore(object):
         except Exception:
             return False
         for name in reversed(names):
+            # 每份快照一个 SAVEPOINT：中途失败就整体回滚，
+            # 否则半截记录会留在这个事务里，被下一份快照的 commit 一起提交，
+            # 结果两代数据混在一起。
+            self.conn.execute('SAVEPOINT snap')
             try:
                 with open(os.path.join(SNAPSHOT_DIR, name),
                           'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if not isinstance(data, list):
-                    continue
+                    raise ValueError('快照根不是数组')
                 seq = 0
                 for it in reversed(data):
                     if not isinstance(it, dict):
@@ -785,13 +797,22 @@ class SqliteStore(object):
                          it.get('w') if k == 'image' else None,
                          it.get('h') if k == 'image' else None,
                          float(it.get('ts') or time.time()), seq))
+                self.conn.execute('RELEASE snap')
                 self.conn.commit()
                 self._seq = seq
                 sys.stderr.write('[cliphist] 已从快照 %s 恢复 %d 条\n'
                                  % (name, seq))
                 sys.stderr.flush()
                 return True
-            except Exception:
+            except Exception as e:
+                try:
+                    self.conn.execute('ROLLBACK TO snap')
+                    self.conn.execute('RELEASE snap')
+                except Exception:
+                    pass
+                sys.stderr.write('[cliphist] 快照 %s 恢复失败（%s），尝试更早一份\n'
+                                 % (name, e))
+                sys.stderr.flush()
                 continue
         return False
 
@@ -919,13 +940,36 @@ class SqliteStore(object):
         if len(self.items) <= limit:
             return []
         dropped = self.items[limit:]
-        del self.items[limit:]
         ids = [(it['_id'],) for it in dropped if it.get('_id')]
-        if ids:
+        if not ids:
+            del self.items[limit:]
+            return dropped
+
+        # DELETE 失败不等于随后 COMMIT 一定失败（例如触发器 RAISE(ABORT)），
+        # 一旦把内存裁剪当成成功，就会在上层删掉对应图片，而库里仍留着这些行。
+        # 这里用 SAVEPOINT 保证：删不全就整体回滚内存与数据库，且不清理任何文件。
+        snapshot = list(self.items)
+        del self.items[limit:]
+        before = self.conn.total_changes
+        try:
+            self.conn.execute('SAVEPOINT trim')
+            self.conn.executemany('DELETE FROM items WHERE id=?', ids)
+            changed = self.conn.total_changes - before
+            if changed != len(ids):
+                raise sqlite3.DatabaseError(
+                    '期望删除 %d 行，实际 %d 行' % (len(ids), changed))
+            self.conn.execute('RELEASE trim')
+        except Exception as e:
             try:
-                self.conn.executemany('DELETE FROM items WHERE id=?', ids)
+                self.conn.execute('ROLLBACK TO trim')
+                self.conn.execute('RELEASE trim')
             except Exception:
                 pass
+            self.items[:] = snapshot          # 内存回滚，与数据库保持一致
+            sys.stderr.write('[cliphist] 裁剪失败（%s），本次不删除任何条目，'
+                             '也不清理图片\n' % e)
+            sys.stderr.flush()
+            return []
         return dropped
 
     def remove(self, index):
@@ -956,12 +1000,43 @@ class SqliteStore(object):
     _purge_files = JsonStore._purge_files
 
 
+def _latest_snapshot_items():
+    """读最近一份可用快照，返回条目列表；没有则返回空。"""
+    try:
+        names = sorted(n for n in os.listdir(SNAPSHOT_DIR) if n.endswith('.json'))
+    except Exception:
+        return []
+    for name in reversed(names):
+        try:
+            with open(os.path.join(SNAPSHOT_DIR, name), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict)]
+        except Exception:
+            continue
+    return []
+
+
 def Store(path):
-    """按可用性选择后端：优先 sqlite，失败则回退到 JSON。"""
+    """按可用性选择后端：优先 sqlite；不可用时按是否已迁移区别处理。"""
     db = os.path.join(os.path.dirname(path), 'history.db')
     try:
         return SqliteStore(db, legacy_json=path)
     except Exception as e:
+        # 已经迁移过（库文件或 .migrated 还在）时，绝不能另建一份独立的
+        # history.json：那会形成第二份权威历史，等 sqlite 恢复后，
+        # 故障期间复制的内容既不在这份 JSON 的视野里，也不会被重新导入。
+        # 此时改为只读安全模式：展示最近快照，不写任何东西。
+        if os.path.exists(db) or os.path.exists(path + '.migrated'):
+            st = JsonStore(path)
+            st.items = _latest_snapshot_items()
+            st.readonly = True
+            st.dirty = False
+            sys.stderr.write(
+                '[cliphist] sqlite 不可用（%s），进入只读安全模式：'
+                '不新建 history.json，展示最近快照的 %d 条记录。\n' % (e, len(st.items)))
+            sys.stderr.flush()
+            return st
         sys.stderr.write('[cliphist] sqlite 存储不可用（%s），回退到 JSON 文件\n' % e)
         sys.stderr.flush()
         return JsonStore(path)
