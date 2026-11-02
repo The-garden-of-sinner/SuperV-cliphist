@@ -1,7 +1,8 @@
 # SuperV-cliphist
 
 **按下 `Super+V`，把复制过的东西原样叫回来。**  
-纯文本、富文本、图片、文件四类内容，单文件实现，不依赖任何第三方包。
+纯文本、富文本、图片、文件四类内容，单文件实现，不依赖任何第三方包；
+面向银河麒麟等国产 Linux 桌面环境调校。
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![GTK](https://img.shields.io/badge/GTK-3.24-4a86cf) ![Platform](https://img.shields.io/badge/platform-X11-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -88,8 +89,9 @@ CopyQ 覆盖面更广，固定条目、标签、脚本、正则搜索都是它�
 > **3** — 通过 ctypes 直接调用 GTK 的 `gtk_clipboard_set_with_data` 实现，
 > 详见「实现说明」。接口不可用时自动降级为纯文本。
 
-选型建议：若受限于软件源，或日常仅处理纯文本，本项目的部署成本更低；  
-若需要处理带格式文本、图片预览或自动化脚本，CopyQ 更为合适。  
+选型建议：若受限于软件源、希望安装即用，且主要在同一台机器上完成「复制—粘贴」
+（四类内容都能按原格式粘回），本项目的部署与维护成本更低；
+若需要图片缩略图预览、固定条目与标签管理、正则搜索或脚本自动化，CopyQ 更为合适。  
 两者互不冲突，可并存试用。
 
 ## 安装
