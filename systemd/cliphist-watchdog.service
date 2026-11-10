@@ -1,0 +1,13 @@
+[Unit]
+Description=SuperV-cliphist watchdog (health check and recovery)
+# DISPLAY / XAUTHORITY / XDG_RUNTIME_DIR are imported into the
+# systemd user manager at login; do not hard-code them here.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/cliphist-watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

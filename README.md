@@ -100,7 +100,7 @@ CopyQ 覆盖面更广，固定条目、标签、脚本、正则搜索都是它�
 ./install.sh
 ```
 
-脚本依次完成：依赖检查 → 安装至 `~/.local/bin` → 配置开机自启 → 启动守护进程。
+脚本依次完成：依赖检查 → 安装至 `~/.local/bin` → 配置开机自启 → 启用看门狗 → 启动守护进程。看门狗是一个由 `systemd --user` 托管的轻量常驻进程，每 30 秒探活一次；守护进程掉线时自动调用 `cliphist ensure` 恢复，无需人工干预。
 
 ### 前置条件
 
@@ -125,8 +125,14 @@ sudo apt install python3-gi gir1.2-gtk-3.0 xdotool
 ```bash
 install -Dm755 cliphist ~/.local/bin/cliphist
 install -Dm644 cliphist.desktop ~/.config/autostart/cliphist.desktop
-cliphist daemon &
+install -Dm755 systemd/cliphist-watchdog.py ~/.local/bin/cliphist-watchdog
+install -Dm644 systemd/cliphist-watchdog.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cliphist-watchdog.service
+cliphist ensure
 ```
+
+若系统没有 `systemd --user`，省略中间四行即可：开机自启仍有效，只是失去掉线自动恢复能力，此时用 `cliphist ensure` 手动拉起。
 
 ## 使用
 
@@ -145,13 +151,31 @@ cliphist daemon &
 命令行：
 
 ```bash
-cliphist            # 呼出面板
+cliphist            # 呼出面板（服务没起来时会自动恢复）
 cliphist settings   # 打开设置
 cliphist status     # 查看状态与条目数
+cliphist ensure     # 一键恢复：检查 / 清理残留 / 重新拉起
 cliphist font 12    # 快速修改字号
 cliphist clear      # 清空历史（含图片文件）
 cliphist stop       # 停止守护进程
 ```
+
+## 故障恢复
+
+`Super+V` 没反应时，绝大多数情况是守护进程不在了——热键本身由该进程抓取，所以它没法自己把自己拉起来。按顺序处理：
+
+```bash
+cliphist status     # 先看是不是真的没在跑
+cliphist ensure     # 一键恢复，成功后会打印「已恢复」
+```
+
+`ensure` 是幂等的：服务正常时什么都不做；否则清理陈旧 socket、结束僵死实例、断开它仍占着的热键，再重新拉起并验证。看门狗和开机自启调用的也是它。
+
+`cliphist stop` 会留下停用标记，看门狗不会把服务擅自拉回；执行 `cliphist`、`cliphist ensure` 或重新登录即可清除该标记。
+
+诊断日志：`~/.local/share/clip-hist/daemon.log`（界面进程）、`start.err`（后台启动失败）、`journalctl --user -u cliphist-watchdog.service`（看门狗）。
+
+X 会话重新登录或 X server 重启时，界面进程可能暂时失去连接。守护此时不再盲目反复重启刷日志，而是等 X 恢复后再重建界面；若旧会话凭证永久失效，最多 60 秒后退出，由看门狗用新会话环境接管。
 
 ## 配置
 

@@ -32,26 +32,44 @@ if [ "${#missing[@]}" -ne 0 ]; then
     say "但选中条目后需手动按 Ctrl+V 粘贴。"
     exit 1
 fi
-say "[1/4] 依赖检查通过"
+say "[1/5] 依赖检查通过"
 
 # ---- 2. 安装主程序 ----
 install -Dm755 "${SRC_DIR}/cliphist" "${BIN_DIR}/cliphist"
-say "[2/4] 已安装 ${BIN_DIR}/cliphist"
+say "[2/5] 已安装 ${BIN_DIR}/cliphist"
 
 # ---- 3. 配置开机自启 ----
 install -Dm644 "${SRC_DIR}/cliphist.desktop" "${AUTOSTART_DIR}/cliphist.desktop"
-say "[3/4] 已配置开机自启"
+say "[3/5] 已配置开机自启（登录时执行 cliphist ensure）"
 
-# ---- 4. 启动守护进程 ----
-if "${BIN_DIR}/cliphist" status 2>/dev/null | grep -q "运行中"; then
-    say "[4/4] 守护进程已在运行，跳过启动"
-else
-    "${BIN_DIR}/cliphist" daemon >/dev/null 2>&1 &
-    sleep 1
-    if "${BIN_DIR}/cliphist" status 2>/dev/null | grep -q "运行中"; then
-        say "[4/4] 守护进程已启动"
+# ---- 4. 安装看门狗 ----
+# 用常驻 service 而不是 oneshot + timer：oneshot 结束时会把刚拉起的
+# daemon 当成 cgroup 残留进程一起杀掉。
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-system-running >/dev/null 2>&1; then
+    install -Dm755 "${SRC_DIR}/systemd/cliphist-watchdog.py" \
+        "${BIN_DIR}/cliphist-watchdog"
+    install -Dm644 "${SRC_DIR}/systemd/cliphist-watchdog.service" \
+        "${HOME}/.config/systemd/user/cliphist-watchdog.service"
+    systemctl --user daemon-reload
+    if systemctl --user enable --now cliphist-watchdog.service >/dev/null 2>&1; then
+        say "[4/5] 已启用看门狗（每 30 秒巡检，掉线自动恢复）"
     else
-        say "[4/4] 守护进程启动失败，请检查当前是否为图形会话（DISPLAY 是否可用）"
+        say "[4/5] 看门狗启用失败，稍后可手动执行："
+        say "      systemctl --user enable --now cliphist-watchdog.service"
+    fi
+else
+    say "[4/5] 未检测到 systemd --user，跳过看门狗（开机自启仍有效）"
+fi
+
+# ---- 5. 启动守护进程 ----
+if "${BIN_DIR}/cliphist" status 2>/dev/null | grep -q "运行中"; then
+    say "[5/5] 守护进程已在运行，跳过启动"
+else
+    if "${BIN_DIR}/cliphist" ensure >/dev/null 2>&1; then
+        say "[5/5] 守护进程已启动"
+    else
+        say "[5/5] 守护进程启动失败，请检查当前是否为图形会话（DISPLAY 是否可用）"
         exit 1
     fi
 fi

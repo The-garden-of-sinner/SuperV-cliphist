@@ -1,11 +1,12 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 """
-cliphist — Win+V 风格的剪贴板历史面板（银河麒麟 / UKUI / X11）
+cliphist — Super+V 风格的剪贴板历史面板（银河麒麟 / UKUI / X11）
 
 零第三方依赖：仅使用系统自带的 GTK3 与 libX11。
     常驻进程：  cliphist daemon
     手动呼出：  cliphist show
+    一键恢复：  cliphist ensure          （服务没反应时用它，幂等）
     停止：      cliphist stop
     状态：      cliphist status
     清空历史：  cliphist clear
@@ -43,6 +44,8 @@ DATA_DIR = os.path.join(HOME, '.local', 'share', 'clip-hist')
 HISTORY_FILE = os.path.join(DATA_DIR, 'history.json')
 IMG_DIR = os.path.join(DATA_DIR, 'images')
 DAEMON_LOG = os.path.join(DATA_DIR, 'daemon.log')   # 子进程 stderr 落盘处
+START_ERR = os.path.join(DATA_DIR, 'start.err')     # 后台拉起失败的原因
+STOP_FLAG = os.path.join(DATA_DIR, 'stopped')       # cliphist stop 的停用标记
 # socket 优先放在 XDG_RUNTIME_DIR（/run/user/UID，本身是 0700），
 # 不可用则退回 ~/.cache；权限收紧到 0600，避免同机其他用户能给守护进程发指令。
 _RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR') or ''
@@ -2547,21 +2550,139 @@ def _spawn_daemon():
         return True
 
     exe = os.path.abspath(__file__)
-    subprocess.Popen([exe, 'daemon'],
-                     stdout=subprocess.DEVNULL,
-                     stderr=open('/tmp/cliphist.err', 'ab'),
-                     start_new_session=True)
-    for _ in range(40):
+    with open(START_ERR, 'ab') as err:
+        subprocess.Popen([exe, 'daemon'],
+                         stdout=subprocess.DEVNULL,
+                         stderr=err,
+                         start_new_session=True)
+    # GTK3 + 剪贴板初始化在这台机器上实测要 4~6 秒，原来只等 4 秒会
+    # 误报「启动失败」，其实进程还在起来。给到 20 秒，并用 ping 确认
+    # 服务端真的开始 accept，而不是只看到 socket 文件存在。
+    for _ in range(200):
         time.sleep(0.1)
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(0.3)
-        try:
-            s.connect(SOCK_FILE)
-            s.close()
+        if _socket_alive():
             return True
-        except Exception:
-            s.close()
     return False
+
+
+def _x_reachable():
+    """只探测 X 连接，不创建 GTK 对象。
+
+    X 会话重建（重新登录 / X server 重启）后，旧进程手里的 DISPLAY
+    与 XAUTHORITY 可能已经失效。这时盲目 fork 界面子进程只会每 5 秒
+    崩一次、刷满日志，还会一直占着会话锁挡住新实例。
+    """
+    try:
+        x11 = ctypes.CDLL('libX11.so.6')
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return False
+        x11.XCloseDisplay(dpy)
+        return True
+    except Exception:
+        return False
+
+
+def _lock_held():
+    """锁是否正被别的进程持有（非阻塞探测，不改文件内容）。"""
+    try:
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+    except Exception:
+        return False
+
+
+def _is_our_daemon(pid):
+    """确认 PID 确实还是本程序的 daemon，避免 PID 复用误杀无关进程。"""
+    try:
+        cmd = open('/proc/%d/cmdline' % pid, 'rb').read().decode('utf-8', 'ignore')
+    except Exception:
+        return False
+    return 'cliphist' in cmd and 'daemon' in cmd
+
+
+def _force_release_lock():
+    """锁被僵死实例占着时，让它退出并释放锁。"""
+    try:
+        pid = int(open(LOCK_FILE).read().strip())
+    except Exception:
+        pid = 0
+    if pid > 1 and pid != os.getpid() and _is_our_daemon(pid):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except Exception:
+                break
+            for _ in range(10 if sig == signal.SIGTERM else 5):
+                time.sleep(0.1)
+                if not _lock_held():
+                    break
+            if not _lock_held():
+                break
+    # 旧守护的 GTK 子进程可能已成孤儿、且落在别的 PID namespace，
+    # os.kill 够不着；用 XKillClient 断掉它还占着的 Super+V 热键。
+    kill_stale_clients()
+    for _ in range(20):
+        if not _lock_held():
+            return
+        time.sleep(0.1)
+
+
+def ensure_running(verbose=True):
+    """健康检查 + 一键恢复：能通就不动，不通才清理残留并重新拉起。
+
+    这是「按 Super+V 没反应」时的手动恢复入口，也是开机自启与
+    systemd 看门狗共用的入口；全程幂等，并发调用由 flock 兜底。
+    """
+    def say(msg):
+        if verbose:
+            print(msg)
+
+    # 任何一次显式的呼出 / 恢复都撤销「手动停止」状态
+    try:
+        os.unlink(STOP_FLAG)
+    except Exception:
+        pass
+
+    if _send('ping'):
+        say('运行中，无需处理')
+        return 0
+    if not _x_reachable():
+        say('X 会话当前不可用，跳过本次恢复')
+        return 0
+
+    # 可能只是刚启动、socket 还没建好：给 8 秒宽限，避免误杀健康实例
+    if _lock_held():
+        for _ in range(80):
+            time.sleep(0.1)
+            if _send('ping'):
+                say('运行中（启动较慢），无需处理')
+                return 0
+
+    say('服务无响应，正在清理残留实例…')
+    _send('quit')
+    _force_release_lock()
+    try:
+        # 已确认没有监听者，陈旧的 socket 文件可以安全删掉
+        if os.path.exists(SOCK_FILE):
+            os.unlink(SOCK_FILE)
+    except Exception:
+        pass
+    if not _spawn_daemon():
+        say('恢复失败，请查看 %s 与 %s' % (START_ERR, DAEMON_LOG))
+        return 1
+    say('已恢复：cliphist 正在运行')
+    return 0
 
 
 def kill_stale_clients():
@@ -2665,15 +2786,30 @@ def _supervise():
             why = 'exit %d' % os.WEXITSTATUS(status)
 
         restarts += 1
-        sys.stderr.write('[cliphist] 界面进程异常退出（%s），第 %d 次重启\n'
-                         % (why, restarts))
-        sys.stderr.flush()
-        if restarts > 30:
-            sys.stderr.write('[cliphist] 连续崩溃过多，停止重启；'
-                             '详见 %s，可执行 cliphist daemon 手动再启动\n'
-                             % DAEMON_LOG)
+        if not _x_reachable():
+            # X 断了就别再 fork：每 5 秒崩一次只会刷满日志、占着会话锁，
+            # 还会让新会话的自启实例误判「已有实例在运行」而放弃接管。
+            sys.stderr.write('[cliphist] X 连接不可用，暂停重启，等待会话恢复\n')
             sys.stderr.flush()
-            return 1
+            waited = 0
+            while not _x_reachable():
+                time.sleep(5)
+                waited += 5
+                if waited >= 60:
+                    # 旧会话凭证可能永久失效，退出让看门狗 / 新会话接管
+                    sys.stderr.write('[cliphist] X 长时间不可用，退出让位给新会话\n')
+                    sys.stderr.flush()
+                    return 1
+            sys.stderr.write('[cliphist] X 已恢复，重启界面进程\n')
+            sys.stderr.flush()
+            restarts = 0
+            continue
+        if restarts <= 5 or restarts % 20 == 0:
+            sys.stderr.write('[cliphist] 界面进程异常退出（%s），第 %d 次重启\n'
+                             % (why, restarts))
+            sys.stderr.flush()
+        # 不再设重启次数上限：MIT-SHM 之类的环境崩溃是间歇性的，
+        # 一旦永久放弃，抓着 Super+V 的进程就再也不会自己回来。
         time.sleep(min(1.0 * restarts, 5.0))
 
 
@@ -2710,8 +2846,17 @@ def main():
         # 比"先删 socket 再抢"可靠——删 socket 会把正在服务的实例踢成孤儿。
         lock = _try_lock()
         if lock is None:
-            sys.stderr.write('[cliphist] 已有实例在运行，本次启动放弃\n')
-            return 0
+            # 拿不到锁不等于对方健康：可能是对端刚启动、socket 还没建好，
+            # 也可能是旧会话残留的僵死守护。先给 6 秒探活宽限，确认真的
+            # 无响应后给出可操作提示，强制接管交给 ensure（避免进程互杀）。
+            for _ in range(60):
+                if _socket_alive():
+                    sys.stderr.write('[cliphist] 已有实例在运行，本次启动放弃\n')
+                    return 0
+                time.sleep(0.1)
+            sys.stderr.write('[cliphist] 锁被占用但服务无响应；'
+                             '执行 cliphist ensure 可强制恢复\n')
+            return 1
 
         # 拿到锁之后，残留的 socket 必然是上次异常退出留下的，可以放心清理。
         # 这里**不能**用 XKillClient —— 残留窗口的 resource id 会被新连接复用，
@@ -2731,17 +2876,26 @@ def main():
 
     elif cmd in ('show', 'toggle', 'settings'):
         if not _send(cmd):
-            if _spawn_daemon():
-                time.sleep(0.15)
-                _send(cmd)
-            else:
-                print('守护进程启动失败，日志见 /tmp/cliphist.err', file=sys.stderr)
+            if ensure_running(verbose=False):
+                print('恢复失败，日志见 %s 与 %s'
+                      % (START_ERR, DAEMON_LOG), file=sys.stderr)
                 return 1
+            time.sleep(0.15)
+            _send(cmd)
+
+    elif cmd == 'ensure':
+        return ensure_running()
 
     elif cmd == 'stop':
         was = _send('quit')
         time.sleep(0.6)
         n = kill_stale_clients()
+        # 留停用标记，否则看门狗会在半分钟内把服务又拉回来。
+        # 下次 cliphist / cliphist ensure / 重新登录会自动清除。
+        try:
+            open(STOP_FLAG, 'w').close()
+        except Exception:
+            pass
         if was or n:
             print('已停止' + ('（另清理残留实例 %d 个）' % n if n else ''))
         else:
