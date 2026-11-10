@@ -38,9 +38,12 @@ say "[1/5] 依赖检查通过"
 install -Dm755 "${SRC_DIR}/cliphist" "${BIN_DIR}/cliphist"
 say "[2/5] 已安装 ${BIN_DIR}/cliphist"
 
-# ---- 3. 配置开机自启 ----
+# ---- 3. 配置开机自启与开始菜单项 ----
 install -Dm644 "${SRC_DIR}/cliphist.desktop" "${AUTOSTART_DIR}/cliphist.desktop"
-say "[3/5] 已配置开机自启（登录时执行 cliphist ensure）"
+APPLICATIONS_DIR="${HOME}/.local/share/applications"
+install -Dm644 "${SRC_DIR}/cliphist-app.desktop" "${APPLICATIONS_DIR}/cliphist.desktop"
+sed -i "s|@BIN@|${BIN_DIR}|g" "${APPLICATIONS_DIR}/cliphist.desktop"
+say "[3/5] 已配置开机自启（登录时执行 cliphist ensure）与开始菜单项（剪贴板历史）"
 
 # ---- 4. 安装看门狗 ----
 # 用常驻 service 而不是 oneshot + timer：oneshot 结束时会把刚拉起的

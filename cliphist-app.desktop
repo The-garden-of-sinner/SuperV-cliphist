@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=剪贴板历史
+Name[zh_CN]=剪贴板历史
+GenericName=Clipboard History
+GenericName[zh_CN]=剪贴板历史面板
+Comment=按 Super+V 呼出剪贴板历史面板（Win+V 风格的剪贴板管理器）
+Comment[zh_CN]=按 Super+V 呼出剪贴板历史面板
+Exec=@BIN@/cliphist show
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;paste;剪贴板;历史;
+NoDisplay=false
+StartupNotify=false
